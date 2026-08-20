@@ -1563,17 +1563,65 @@ fn a_comment_in_a_fragment_is_blanked_out() {
     // A template using `${?...}` may not contain a SQL comment; a fragment is
     // opaque to that check, so a comment inside one used to comment out the
     // template text after the marker. `sql_fragment!` now blanks it, so the
-    // fragment keeps working and the following text survives.
+    // fragment keeps working and the following text survives. The comment's
+    // bytes become spaces rather than disappearing — see the next test for why.
     const NOTED: SqlFragment = sql_fragment!("c = 1 -- why");
     let x = Some(1i32);
     assert_eq!(
         query!("SELECT * FROM t WHERE a = ${?x} AND #{NOTED} AND b = 1").sql(),
-        "SELECT * FROM t WHERE a = $1 AND c = 1 AND b = 1"
+        "SELECT * FROM t WHERE a = $1 AND c = 1        AND b = 1"
     );
     let x: Option<i32> = None;
     assert_eq!(
         query!("SELECT * FROM t WHERE a = ${?x} AND #{NOTED} AND b = 1").sql(),
-        "SELECT * FROM t WHERE c = 1 AND b = 1"
+        "SELECT * FROM t WHERE c = 1        AND b = 1"
+    );
+}
+
+#[test]
+fn a_quote_inside_a_fragments_comment_does_not_open_a_literal() {
+    // Literals and comments are mutually exclusive contexts. Scanning for
+    // literals first let a `'` inside a comment open one, which swallowed the
+    // comment's `*/` and left the tail of the comment in the emitted SQL.
+    const APOSTROPHE: SqlFragment = sql_fragment!("c = 1 /* it's */ AND d = 2");
+    const LINE: SqlFragment = sql_fragment!("c = 1 -- it's");
+    const IDENT: SqlFragment = sql_fragment!(r#"c = 1 /* "x" */ AND d = 2"#);
+    const TAG: SqlFragment = sql_fragment!("/* $tag$ */ a = 1");
+    let x = Some(1i32);
+    assert_eq!(
+        query!("SELECT * FROM t WHERE a = ${?x} AND #{APOSTROPHE}").sql(),
+        "SELECT * FROM t WHERE a = $1 AND c = 1            AND d = 2"
+    );
+    assert_eq!(
+        query!("SELECT * FROM t WHERE a = ${?x} AND #{LINE}").sql(),
+        "SELECT * FROM t WHERE a = $1 AND c = 1        "
+    );
+    assert_eq!(
+        query!("SELECT * FROM t WHERE a = ${?x} AND #{IDENT}").sql(),
+        "SELECT * FROM t WHERE a = $1 AND c = 1           AND d = 2"
+    );
+    assert_eq!(
+        query!("SELECT * FROM t WHERE a = ${?x} AND #{TAG}").sql(),
+        "SELECT * FROM t WHERE a = $1 AND             a = 1"
+    );
+    // Dropping the predicate must not change the fragment either.
+    let x: Option<i32> = None;
+    assert_eq!(
+        query!("SELECT * FROM t WHERE a = ${?x} AND #{APOSTROPHE}").sql(),
+        "SELECT * FROM t WHERE c = 1            AND d = 2"
+    );
+}
+
+#[test]
+fn a_fragments_leading_and_trailing_space_is_preserved() {
+    // A fragment is spliced verbatim, so its edges are the separators between it
+    // and the template. Blanking a comment must not also trim them, or
+    // `WHERE#{F}` would become `WHEREa = 1`.
+    const PADDED: SqlFragment = sql_fragment!(" a = 1 -- x");
+    let x = Some(1i32);
+    assert_eq!(
+        query!("SELECT * FROM t WHERE b = ${?x} AND#{PADDED}").sql(),
+        "SELECT * FROM t WHERE b = $1 AND a = 1     "
     );
 }
 

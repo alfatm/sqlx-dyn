@@ -4,7 +4,7 @@ mod parse;
 
 use parse::{
     fragment_brackets_unbalanced, fragment_comment_unterminated, fragment_comments_blanked,
-    fragment_starts_with_joiner, parse_template, Part,
+    fragment_is_empty, fragment_starts_with_joiner, parse_template, Part,
 };
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
@@ -62,10 +62,15 @@ pub fn query_scalar(input: TokenStream) -> TokenStream {
 /// Only string literals are accepted, so runtime data cannot reach a fragment
 /// through this macro. SQL comments are stripped from the text
 /// ([`parse::fragment_comments_blanked`]), and it is rejected if it leaves a
-/// block comment unterminated ([`parse::fragment_comment_unterminated`]), starts
-/// with `AND`/`OR` ([`parse::fragment_starts_with_joiner`]) or leaves brackets
+/// block comment unterminated ([`parse::fragment_comment_unterminated`]),
+/// contributes no SQL at all ([`parse::fragment_is_empty`]), starts with
+/// `AND`/`OR` ([`parse::fragment_starts_with_joiner`]) or leaves brackets
 /// unbalanced ([`parse::fragment_brackets_unbalanced`]). Clause keywords are
 /// deliberately allowed; the last of those explains why.
+///
+/// Every one of those checks reads the single lexical pass in
+/// [`parse::FragmentLex`], because literals and comments hide each other's
+/// delimiters and cannot be scanned in layers.
 #[proc_macro]
 pub fn sql_fragment(input: TokenStream) -> TokenStream {
     let lit = match syn::parse::<LitStr>(input) {
@@ -87,9 +92,26 @@ pub fn sql_fragment(input: TokenStream) -> TokenStream {
         .to_compile_error()
         .into();
     }
+    // A fragment that contributes nothing splices an empty string into the
+    // template, so `WHERE #{F}` becomes a bare `WHERE`: a runtime syntax error
+    // pointing at the template rather than at the fragment behind it.
+    if fragment_is_empty(&lit.value()) {
+        return syn::Error::new(
+            lit.span(),
+            "this SQL fragment contributes no SQL.\n\
+             Spliced into a template it leaves nothing behind, so \
+             `WHERE #{F}` becomes a bare `WHERE` and PostgreSQL rejects the \
+             query at runtime, naming the template instead of this fragment.\n\
+             Write the predicate, or drop the marker from the template.",
+        )
+        .to_compile_error()
+        .into();
+    }
     // A closed comment describes the fragment; it is not SQL the fragment
     // contributes. Blank it here so it cannot escape the whole-template comment
-    // rule, and let the fragment keep working.
+    // rule, and let the fragment keep working. Whitespace is left as written:
+    // a fragment is spliced verbatim, so its edges are the separators between it
+    // and the template around it.
     let value = lit.value();
     let sql = fragment_comments_blanked(&value).unwrap_or(value);
     let lit = LitStr::new(&sql, lit.span());

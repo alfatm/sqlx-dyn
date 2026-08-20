@@ -354,17 +354,26 @@ that, and the query silently matches different rows.
 ```rust
 const F: SqlFragment = sql_fragment!("c = 1 -- why");
 query!("SELECT * FROM t WHERE a = ${?x} AND #{F} AND b = 1");
-// -> SELECT * FROM t WHERE a = $1 AND c = 1 AND b = 1
+// -> SELECT * FROM t WHERE a = $1 AND c = 1        AND b = 1
 //    the comment is gone; `AND b = 1` survives
 ```
 
 Comments are blanked to spaces, never deleted, so the tokens they separated stay
 separated: `c = 1/* note */AND d = 2` keeps its gap instead of collapsing into
-`1AND`. A `--` or `/*` inside a string literal or dollar-quoted body is data and
-passes through untouched.
+`1AND`. That is where the run of spaces above comes from. Nothing else is
+touched — including the fragment's own leading and trailing whitespace, which is
+what separates it from the template around it.
+
+A `--` or `/*` inside a string literal or dollar-quoted body is data and passes
+through untouched. So is a quote inside a comment: `/* it's */` is a comment
+containing an apostrophe, not a comment plus an open literal.
 
 An **unterminated** `/*` is rejected rather than stripped: there is no end to
 strip up to, so it would swallow whatever follows the marker.
+
+A fragment that contributes nothing but a comment is rejected too. It would
+splice an empty string, leaving `WHERE #{F}` as a bare `WHERE` — an error
+PostgreSQL raises against the template, not against the fragment that caused it.
 
 `sql_fragment!` also rejects a fragment that _starts_ with `AND`/`OR`, for the
 same reason: the joiner says how the fragment is combined, not what it is, and
@@ -523,7 +532,7 @@ The injection model is tested from both sides:
   needs no daemon:
 
   ```sh
-  cargo test                     # 248 tests, no Docker
+  cargo test                     # 253 tests, no Docker
   cargo test --features e2e      # + 16 tests against a real server
   ```
 

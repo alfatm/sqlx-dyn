@@ -1,0 +1,7 @@
+error: this SQL fragment contributes no SQL.
+       Spliced into a template it leaves nothing behind, so `WHERE #{F}` becomes a bare `WHERE` and PostgreSQL rejects the query at runtime, naming the template instead of this fragment.
+       Write the predicate, or drop the marker from the template.
+ --> tests/compile_fail/fragment_only_a_comment.rs:7:28
+  |
+7 |     let _f = sql_fragment!("-- only a note");
+  |                            ^^^^^^^^^^^^^^^^

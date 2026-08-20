@@ -42,6 +42,8 @@ impl SqlFragment {
     /// - a SQL comment, which `sql_fragment!` strips; left in, it comments out
     ///   the template text following the marker and silently changes which rows
     ///   match — and an unterminated `/*`, which the macro rejects outright;
+    /// - text that contributes no SQL, which splices an empty string and leaves
+    ///   `WHERE #{F}` as a bare `WHERE`;
     /// - a leading `AND`/`OR`, which is left dangling when the optional
     ///   predicate before it drops;
     /// - brackets that do not balance within the fragment, which reach into the

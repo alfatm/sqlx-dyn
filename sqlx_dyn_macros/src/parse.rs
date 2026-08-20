@@ -257,6 +257,148 @@ pub fn parse_template(input: &str, span: Span) -> Result<Vec<Part>, ParseError> 
 const CLAUSE_BOUNDARIES: [&str; 6] =
     ["WHERE", "HAVING", "UNION", "INTERSECT", "EXCEPT", "QUALIFY"];
 
+/// One lexical pass over a fragment, producing every view the fragment checks
+/// need.
+///
+/// The checks cannot be layered on top of each other, because literals and
+/// comments are *mutually exclusive* contexts and each hides the other's
+/// delimiters. Running [`strip_literals`] first and looking for comments in its
+/// output gets this wrong in both directions: a `'` written inside a comment
+/// (`/* it's */`) opens a literal that swallows the comment's `*/`, so the
+/// comment reads as unterminated; and a `--` inside a literal is only *not* a
+/// comment because the literal was blanked first. Only a single scan that tracks
+/// which context it is in can tell the two apart.
+///
+/// Offsets are preserved byte for byte in both views, so an index found in one
+/// indexes the source and the other.
+struct FragmentLex {
+    /// The source with comment bytes blanked to spaces and everything else —
+    /// literals included — left exactly as written. This is the text the
+    /// fragment contributes to the query.
+    ///
+    /// Blanked, never deleted: `1/*x*/AND` must not become `1AND`, so each
+    /// comment byte becomes a space and the tokens it separated stay separated.
+    comments_blanked: String,
+    /// Uppercased, with both literals and comments blanked. Structure only, for
+    /// keyword and bracket matching.
+    structure: String,
+    /// Whether a `/*` is left unclosed at the end of the fragment.
+    unterminated_block: bool,
+    /// Whether any comment was found at all.
+    has_comment: bool,
+}
+
+impl FragmentLex {
+    fn scan(sql: &str) -> Self {
+        let bytes = sql.as_bytes();
+        let mut blanked = bytes.to_vec();
+        // Structure starts fully blank and is filled in only for bytes the scan
+        // classifies as SQL, so anything it skips is already blank.
+        let mut structure = vec![b' '; bytes.len()];
+        let mut has_comment = false;
+        let mut unterminated_block = false;
+        let mut i = 0;
+
+        while i < bytes.len() {
+            // A line comment runs to the newline, which stays: it is whitespace
+            // either way and keeps the tokens on both sides apart.
+            if bytes[i] == b'-' && bytes[i + 1..].starts_with(b"-") {
+                has_comment = true;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    blanked[i] = b' ';
+                    i += 1;
+                }
+                continue;
+            }
+            // Block comments nest in PostgreSQL. Quotes, `$tag$` and non-ASCII
+            // bytes inside one are comment text, not delimiters — which is the
+            // whole reason this scan exists.
+            if bytes[i] == b'/' && bytes[i + 1..].starts_with(b"*") {
+                has_comment = true;
+                let mut nesting = 0usize;
+                while i < bytes.len() {
+                    if bytes[i] == b'/' && bytes[i + 1..].starts_with(b"*") {
+                        nesting += 1;
+                        blanked[i] = b' ';
+                        blanked[i + 1] = b' ';
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == b'*' && bytes[i + 1..].starts_with(b"/") {
+                        nesting -= 1;
+                        blanked[i] = b' ';
+                        blanked[i + 1] = b' ';
+                        i += 2;
+                        if nesting == 0 {
+                            break;
+                        }
+                        continue;
+                    }
+                    blanked[i] = b' ';
+                    i += 1;
+                }
+                if nesting != 0 {
+                    unterminated_block = true;
+                }
+                continue;
+            }
+            // Dollar-quoted literal: `$tag$ ... $tag$`. Its body is arbitrary
+            // text, so brackets, quotes and comment markers inside it are data.
+            if bytes[i] == b'$' {
+                if let Some(tag) = dollar_tag(bytes, i) {
+                    i = find_subslice(bytes, i + tag, &bytes[i..i + tag])
+                        .map_or(bytes.len(), |at| at + tag);
+                    continue;
+                }
+                structure[i] = b'$';
+                i += 1;
+                continue;
+            }
+            // `'...'` / `"..."`. A doubled quote is an escaped quote; a
+            // backslash escapes the next character in `E'...'` strings and under
+            // `standard_conforming_strings = off`. Treating `\'` as one unit
+            // keeps `E'a\'b'` intact at the cost of running past the closing
+            // quote of `'a\'`, which is complete under the default setting. Here
+            // that costs a false *rejection* — a compile error on working SQL —
+            // which is the safe direction.
+            if bytes[i] == b'\'' || bytes[i] == b'"' {
+                let q = bytes[i];
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == q {
+                        if bytes.get(i + 1) == Some(&q) {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            if bytes[i].is_ascii() {
+                structure[i] = bytes[i].to_ascii_uppercase();
+            }
+            // A non-ASCII byte cannot be part of a keyword; leaving it blank in
+            // `structure` keeps that view ASCII and the offsets aligned.
+            i += 1;
+        }
+
+        Self {
+            comments_blanked: String::from_utf8(blanked)
+                .expect("only ASCII spaces were written over comment bytes"),
+            structure: String::from_utf8(structure).expect("structure is ASCII by construction"),
+            unterminated_block,
+            has_comment,
+        }
+    }
+}
+
 /// Blanks a fragment's SQL comments, or `None` when it has none.
 ///
 /// A template using `${?...}` may not contain a comment, because one can hide
@@ -275,33 +417,31 @@ const CLAUSE_BOUNDARIES: [&str; 6] =
 ///
 /// A comment is a *comment about the fragment*, not SQL the fragment
 /// contributes, so it is blanked rather than rejected: the fragment keeps
-/// working and the hazard is gone. Blanked, never deleted — `1/*x*/AND` must not
-/// become `1AND`, so each comment byte becomes a space and the tokens it
-/// separated stay separated.
+/// working and the hazard is gone. Only the comment is touched — a `--` or `/*`
+/// inside a string literal or a dollar-quoted body is data and survives, and a
+/// quote *inside* a comment is comment text, not a literal. See [`FragmentLex`].
 ///
-/// Literals are preserved: positions come from the [`strip_literals`] view, so
-/// `'--'` and `$tag$--$tag$` are data and pass through unchanged. An unclosed
-/// `/*` is a separate matter — see [`fragment_comment_unterminated`].
+/// Whitespace is not trimmed: a fragment is spliced verbatim, so its leading and
+/// trailing spaces are the separators between it and the template around it.
+/// Blanking a comment must not also delete them — that is what would turn
+/// `WHERE#{F}` into `WHEREa = 1`. An unclosed `/*` is a separate matter — see
+/// [`fragment_comment_unterminated`].
 pub fn fragment_comments_blanked(sql: &str) -> Option<String> {
-    // Comment positions are found on the stripped view, where a `--` inside a
-    // literal or a dollar-quoted body is already gone, then applied to the
-    // original so the literals themselves survive untouched. Offsets agree
-    // because `strip_literals` preserves them byte for byte.
-    let stripped = strip_literals(sql);
-    find_comment(&stripped)?;
-    let mask = blank_comments(&stripped);
-    let mut out = sql.as_bytes().to_vec();
-    for (i, b) in mask.bytes().enumerate() {
-        // A byte the mask blanked but the stripped view did not is comment text.
-        if b == b' ' && stripped.as_bytes()[i] != b' ' {
-            out[i] = b' ';
-        }
-    }
-    let blanked = String::from_utf8(out).expect("only ASCII spaces were written");
-    // Interior spacing must stay (it is what keeps `1/*x*/AND` from becoming
-    // `1AND`), but the fragment's own edges are a boundary: trimming them keeps
-    // the emitted SQL tidy and matches what the author would have written.
-    Some(blanked.trim().to_string())
+    let lex = FragmentLex::scan(sql);
+    lex.has_comment.then_some(lex.comments_blanked)
+}
+
+/// Whether a fragment is empty, or contributes nothing but whitespace.
+///
+/// A fragment holding only a comment blanks away to nothing. Emitting it would
+/// splice an empty string where SQL was expected, so `WHERE #{NOTE}` becomes a
+/// bare `WHERE` — a syntax error at runtime, pointing at the template rather
+/// than at the fragment that caused it. Rejecting it names the real problem.
+///
+/// Runs on the comment-blanked text, so this is what the fragment would actually
+/// contribute, not what was written.
+pub fn fragment_is_empty(sql: &str) -> bool {
+    FragmentLex::scan(sql).comments_blanked.trim().is_empty()
 }
 
 /// Whether a fragment leaves a block comment unterminated.
@@ -311,45 +451,10 @@ pub fn fragment_comments_blanked(sql: &str) -> Option<String> {
 /// at. `--` needs no such rule — a line comment is closed by the end of the
 /// fragment, and blanking it removes it entirely.
 ///
-/// Matched on the [`strip_literals`] view, so a `/*` inside a literal is data.
+/// A `/*` inside a literal is data, and a `/*` inside another block comment
+/// nests, so both are resolved by the single scan in [`FragmentLex`].
 pub fn fragment_comment_unterminated(sql: &str) -> bool {
-    let stripped = strip_literals(sql);
-    let bytes = stripped.as_bytes();
-    let mut i = 0;
-
-    while i < bytes.len() {
-        if bytes[i] == b'-' && bytes[i + 1..].starts_with(b"-") {
-            while i < bytes.len() && bytes[i] != b'\n' {
-                i += 1;
-            }
-            continue;
-        }
-        if bytes[i] == b'/' && bytes[i + 1..].starts_with(b"*") {
-            let mut nesting = 0usize;
-            while i < bytes.len() {
-                if bytes[i] == b'/' && bytes[i + 1..].starts_with(b"*") {
-                    nesting += 1;
-                    i += 2;
-                    continue;
-                }
-                if bytes[i] == b'*' && bytes[i + 1..].starts_with(b"/") {
-                    nesting -= 1;
-                    i += 2;
-                    if nesting == 0 {
-                        break;
-                    }
-                    continue;
-                }
-                i += 1;
-            }
-            if nesting != 0 {
-                return true;
-            }
-            continue;
-        }
-        i += 1;
-    }
-    false
+    FragmentLex::scan(sql).unterminated_block
 }
 
 /// Whether a fragment starts with `AND`/`OR`, which the template must own.
@@ -369,10 +474,10 @@ pub fn fragment_comment_unterminated(sql: &str) -> bool {
 /// correctly. Nothing is lost: the joiner belongs to how the fragment is
 /// *combined*, not to the fragment.
 ///
-/// Matched on the comment-blanked [`strip_literals`] view, so a leading comment
-/// does not hide the keyword.
+/// Matched on the [`FragmentLex`] structure view, so a leading comment does not
+/// hide the keyword and a leading literal cannot fake one.
 pub fn fragment_starts_with_joiner(sql: &str) -> Option<&'static str> {
-    let view = blank_comments(&strip_literals(sql));
+    let view = FragmentLex::scan(sql).structure;
     let head = view.trim_start();
     ["AND", "OR"].into_iter().find(|kw| {
         head.strip_prefix(*kw).is_some_and(|rest| {
@@ -401,13 +506,13 @@ pub fn fragment_starts_with_joiner(sql: &str) -> Option<&'static str> {
 /// and optional predicates" section of the crate docs — and it produces SQL
 /// Postgres rejects, not SQL that silently means something else.
 ///
-/// Brackets are matched on the comment-blanked [`strip_literals`] view, so a
-/// bracket inside a string literal, a dollar-quoted body or a SQL comment is
-/// data and does not count.
+/// Brackets are matched on the [`FragmentLex`] structure view, so a bracket
+/// inside a string literal, a dollar-quoted body or a SQL comment is data and
+/// does not count.
 ///
 /// Returns `true` when the fragment must be rejected.
 pub fn fragment_brackets_unbalanced(sql: &str) -> bool {
-    let bytes = blank_comments(&strip_literals(sql)).into_bytes();
+    let bytes = FragmentLex::scan(sql).structure.into_bytes();
     let mut depth = 0i32;
 
     for b in bytes {
@@ -577,62 +682,6 @@ fn strip_literals(sql: &str) -> String {
         }
     }
     String::from_utf8(out).expect("all bytes are ASCII by construction")
-}
-
-/// Blanks SQL comments in a [`strip_literals`] view, preserving byte offsets.
-///
-/// `strip_literals` blanks string literals but leaves comments alone, because
-/// the whole-template rule is that a template using `${?...}` may not contain
-/// one at all. Checks that only care about *structure* — brackets, joiners —
-/// must not see a bracket or keyword that sits in a comment, since that is
-/// text, not SQL.
-///
-/// Takes the stripped view rather than raw SQL so a `--` inside a literal is
-/// already gone and cannot start a phantom comment.
-fn blank_comments(stripped: &str) -> String {
-    let bytes = stripped.as_bytes();
-    let mut out = bytes.to_vec();
-    let mut i = 0;
-
-    while i < bytes.len() {
-        if bytes[i] == b'-' && bytes[i + 1..].starts_with(b"-") {
-            // A line comment runs to the newline, which stays: it is whitespace
-            // either way and keeps tokens on both sides apart.
-            while i < bytes.len() && bytes[i] != b'\n' {
-                out[i] = b' ';
-                i += 1;
-            }
-            continue;
-        }
-        if bytes[i] == b'/' && bytes[i + 1..].starts_with(b"*") {
-            // Block comments nest in PostgreSQL.
-            let mut nesting = 0usize;
-            while i < bytes.len() {
-                if bytes[i] == b'/' && bytes[i + 1..].starts_with(b"*") {
-                    nesting += 1;
-                    out[i] = b' ';
-                    out[i + 1] = b' ';
-                    i += 2;
-                    continue;
-                }
-                if bytes[i] == b'*' && bytes[i + 1..].starts_with(b"/") {
-                    nesting -= 1;
-                    out[i] = b' ';
-                    out[i + 1] = b' ';
-                    i += 2;
-                    if nesting == 0 {
-                        break;
-                    }
-                    continue;
-                }
-                out[i] = b' ';
-                i += 1;
-            }
-            continue;
-        }
-        i += 1;
-    }
-    String::from_utf8(out).expect("blanking keeps the input ASCII")
 }
 
 /// If a marker or escape starts at `at`, the offset just past it.
@@ -1318,15 +1367,57 @@ mod fragment_checks {
             fragment_comments_blanked("c = 1 /* x */ AND d = 2").as_deref(),
             Some("c = 1         AND d = 2")
         );
-        // Trailing comments leave nothing behind once the edges are trimmed.
+        // Whitespace is not trimmed: the fragment's edges are the separators
+        // between it and the template, so blanking a comment must not also
+        // delete them.
         assert_eq!(
             fragment_comments_blanked("c = 1 -- trailing").as_deref(),
-            Some("c = 1")
+            Some("c = 1            ")
         );
         assert_eq!(
             fragment_comments_blanked("/* lead */ c = 1").as_deref(),
-            Some("c = 1")
+            Some("           c = 1")
         );
+    }
+
+    #[test]
+    fn a_quote_inside_a_comment_is_comment_text() {
+        // The delimiters are mutually exclusive: a `'` written inside a comment
+        // must not open a literal, or it would swallow the comment's `*/` and
+        // leave part of the comment in the emitted SQL.
+        for (sql, want) in [
+            ("c = 1 /* it's */ AND d = 2", "c = 1            AND d = 2"),
+            ("c = 1 -- it's", "c = 1        "),
+            ("c = 1 -- 'x' = 'y'", "c = 1             "),
+            ("c = 1 /* \"x\" */ AND d = 2", "c = 1           AND d = 2"),
+            ("/* $tag$ */ a = 1", "            a = 1"),
+            ("/* ' */ a = 1", "        a = 1"),
+        ] {
+            assert_eq!(fragment_comments_blanked(sql).as_deref(), Some(want), "{sql:?}");
+            assert!(!fragment_comment_unterminated(sql), "{sql:?}");
+        }
+    }
+
+    #[test]
+    fn a_non_ascii_comment_byte_is_blanked() {
+        // A multi-byte char in a comment is comment text like any other. Each of
+        // its bytes is blanked, so nothing of it reaches the SQL.
+        assert_eq!(
+            fragment_comments_blanked("c = 1 -- \u{e9}").as_deref(),
+            Some("c = 1      ")
+        );
+        // A non-ASCII byte outside a comment is data and survives.
+        assert_eq!(fragment_comments_blanked("s = '\u{e9}'"), None);
+    }
+
+    #[test]
+    fn a_fragment_contributing_nothing_is_rejected() {
+        for sql in ["", "   ", "-- only a note", "/* note */", "\n\t"] {
+            assert!(fragment_is_empty(sql), "{sql:?}");
+        }
+        for sql in ["c = 1", "-- x\nc = 1", " a = 1 "] {
+            assert!(!fragment_is_empty(sql), "{sql:?}");
+        }
     }
 
     #[test]
@@ -1338,7 +1429,8 @@ mod fragment_checks {
 
     #[test]
     fn a_comment_marker_inside_a_literal_is_not_a_comment() {
-        // `strip_literals` runs first, so these are data and survive verbatim.
+        // Inside a literal there is no comment to find, so these survive
+        // verbatim.
         for sql in [
             "s = '--'",
             "s = $tag$--$tag$",
@@ -1359,6 +1451,8 @@ mod fragment_checks {
         // A line comment needs no such rule — the fragment's end closes it.
         assert!(!fragment_comment_unterminated("c = 1 -- x"));
         assert!(!fragment_comment_unterminated("c = 1 /* x */"));
+        // A `--` inside a block comment does not close it.
+        assert!(fragment_comment_unterminated("c = 1 /* -- */ /* x"));
     }
 
     #[test]

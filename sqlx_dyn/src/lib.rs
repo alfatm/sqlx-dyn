@@ -253,10 +253,16 @@
 //! would comment out the template text after the marker — PostgreSQL accepts
 //! that, and the query silently matches different rows. Comments are blanked to
 //! spaces rather than deleted, so `c = 1/* note */AND d = 2` does not collapse
-//! into `1AND`. `'--'` and `$tag$--$tag$` are data and pass through untouched.
+//! into `1AND`. Nothing else is touched, including the fragment's own leading
+//! and trailing whitespace: that is what separates it from the template around
+//! it. `'--'` and `$tag$--$tag$` are data and pass through untouched, and so
+//! does a quote inside a comment — `/* it's */` is a comment containing an
+//! apostrophe, not a comment plus an open literal.
 //!
 //! An *unterminated* `/*` is rejected instead: there is no end to strip up to,
-//! so it would swallow whatever follows the marker.
+//! so it would swallow whatever follows the marker. So is a fragment that
+//! contributes nothing but a comment: it would splice an empty string, leaving
+//! `WHERE #{F}` as a bare `WHERE` that PostgreSQL blames on the template.
 //!
 //! For the same reason [`sql_fragment!`] rejects a fragment that *starts* with
 //! `AND`/`OR`. The joiner describes how the fragment is combined, not what it

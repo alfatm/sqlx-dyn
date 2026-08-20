@@ -7,7 +7,7 @@ description = "Ergonomic template macros over sqlx::QueryBuilder for PostgreSQL:
 repository = "https://github.com/alfatm/sqlx-dyn"
 readme = "../README.md"
 keywords = ["sqlx", "postgres", "query-builder", "proc-macro", "injection"]
-categories = ["database", "development-tools/procedural-macro"]
+categories = ["database", "development-tools::procedural-macros"]
 
 [dependencies]
 sqlx.workspace = true

@@ -7,7 +7,7 @@ description = "Proc-macro implementation of the sqlx_dyn crate"
 repository = "https://github.com/alfatm/sqlx-dyn"
 readme = "../README.md"
 keywords = ["sqlx", "postgres", "query-builder", "proc-macro"]
-categories = ["development-tools/procedural-macro"]
+categories = ["development-tools::procedural-macros"]
 
 [lib]
 proc-macro = true

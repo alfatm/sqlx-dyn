@@ -1136,3 +1136,355 @@ fn an_escaped_marker_does_not_shift_the_clause_of_a_later_predicate() {
         "SELECT '${?x}' AS s FROM t"
     );
 }
+
+// --- the predicate tail is matched on SQL, never on literal data ---
+//
+// The tail scanner looks for `)`, `;`, a joiner or a clause keyword to find
+// where the predicate ends. Every one of those can also appear *inside* a
+// string literal, a quoted identifier or a dollar-quoted body, where it is
+// data. Matching there cut the predicate mid-literal, leaving a dangling
+// joiner and an unterminated quote.
+
+#[test]
+fn a_joiner_inside_a_literal_does_not_end_the_predicate() {
+    // Worst case: `AND` is data here, but stopping at it left
+    // `SELECT * FROM t WHERE '` — a dangling `WHERE` plus an open literal.
+    let x: Option<i32> = None;
+    assert_eq!(
+        query!("SELECT * FROM t WHERE a = ${?x} || ' AND '").sql(),
+        "SELECT * FROM t"
+    );
+    let x = Some(1i32);
+    assert_eq!(
+        query!("SELECT * FROM t WHERE a = ${?x} || ' AND '").sql(),
+        "SELECT * FROM t WHERE a = $1 || ' AND '"
+    );
+}
+
+#[test]
+fn a_joiner_inside_a_literal_does_not_strand_a_later_predicate() {
+    // The sharpest form: the later bind survives and is dispatched, so a
+    // mis-cut tail loses predicate `a` while `$1` still binds.
+    let a: Option<i32> = None;
+    let b = Some(2i32);
+    assert_eq!(
+        query!("SELECT * FROM t WHERE a = ${?a} || ' AND ' AND b = ${?b}").sql(),
+        "SELECT * FROM t WHERE b = $1"
+    );
+}
+
+#[test]
+fn a_bracket_or_separator_inside_a_literal_does_not_end_the_predicate() {
+    let x: Option<i32> = None;
+    assert_eq!(
+        query!("SELECT * FROM t WHERE a = ${?x} || ')'").sql(),
+        "SELECT * FROM t"
+    );
+    assert_eq!(
+        query!("SELECT * FROM t WHERE a = ${?x} || ';'").sql(),
+        "SELECT * FROM t"
+    );
+    // Same token, dollar-quoted body.
+    assert_eq!(
+        query!("SELECT * FROM t WHERE a = ${?x} || $q$)$q$").sql(),
+        "SELECT * FROM t"
+    );
+    let x = Some(1i32);
+    assert_eq!(
+        query!("SELECT * FROM t WHERE a = ${?x} || ')'").sql(),
+        "SELECT * FROM t WHERE a = $1 || ')'"
+    );
+}
+
+#[test]
+fn a_clause_keyword_inside_a_literal_does_not_end_the_predicate() {
+    let x: Option<i32> = None;
+    assert_eq!(
+        query!("SELECT * FROM t WHERE a = ${?x} || 'LIMIT'").sql(),
+        "SELECT * FROM t"
+    );
+    let x = Some(1i32);
+    assert_eq!(
+        query!("SELECT * FROM t WHERE a = ${?x} || 'LIMIT'").sql(),
+        "SELECT * FROM t WHERE a = $1 || 'LIMIT'"
+    );
+}
+
+#[test]
+fn a_real_bracket_still_ends_the_predicate() {
+    // The literal-aware scan must not lose the genuine cases: this `)` closes
+    // a subquery the marker sits inside.
+    let x: Option<i32> = None;
+    assert_eq!(
+        query!("SELECT * FROM t WHERE id IN (SELECT id FROM u WHERE a = ${?x})").sql(),
+        "SELECT * FROM t WHERE id IN (SELECT id FROM u)"
+    );
+    let x = Some(1i32);
+    assert_eq!(
+        query!("SELECT * FROM t WHERE id IN (SELECT id FROM u WHERE a = ${?x})").sql(),
+        "SELECT * FROM t WHERE id IN (SELECT id FROM u WHERE a = $1)"
+    );
+}
+
+// --- trailing top-level clauses are mandatory SQL, not predicate tail ---
+
+#[test]
+fn a_locking_clause_survives_a_dropped_predicate() {
+    // `FOR UPDATE` was swallowed with the predicate: the lock silently
+    // disappeared, which changes what the statement does rather than
+    // breaking it.
+    let x: Option<i32> = None;
+    assert_eq!(
+        query!("SELECT * FROM t WHERE a = ${?x} FOR UPDATE").sql(),
+        "SELECT * FROM t FOR UPDATE"
+    );
+    let x = Some(1i32);
+    assert_eq!(
+        query!("SELECT * FROM t WHERE a = ${?x} FOR UPDATE").sql(),
+        "SELECT * FROM t WHERE a = $1 FOR UPDATE"
+    );
+}
+
+#[test]
+fn a_locking_clause_survives_in_lower_case_too() {
+    let x: Option<i32> = None;
+    assert_eq!(
+        query!("select * from t where a = ${?x} for update").sql(),
+        "select * from t for update"
+    );
+}
+
+#[test]
+fn an_on_conflict_clause_survives_a_dropped_predicate() {
+    let x: Option<i32> = None;
+    assert_eq!(
+        query!("UPDATE t SET x = 1 WHERE y = ${?x} ON CONFLICT DO NOTHING").sql(),
+        "UPDATE t SET x = 1 ON CONFLICT DO NOTHING"
+    );
+}
+
+#[test]
+fn a_window_clause_survives_a_dropped_predicate() {
+    let x: Option<i32> = None;
+    assert_eq!(
+        query!("SELECT * FROM t WHERE a = ${?x} WINDOW w AS (PARTITION BY b)").sql(),
+        "SELECT * FROM t WINDOW w AS (PARTITION BY b)"
+    );
+    let x = Some(1i32);
+    assert_eq!(
+        query!("SELECT * FROM t WHERE a = ${?x} WINDOW w AS (PARTITION BY b)").sql(),
+        "SELECT * FROM t WHERE a = $1 WINDOW w AS (PARTITION BY b)"
+    );
+}
+
+// --- CTE fragments ---
+//
+// Two shapes, and the split between them is the whole point: a CTE can be the
+// fragment (`#{CTE} SELECT ...`) or the fragment can be its body
+// (`WITH t AS (#{body}) ...`). The second puts a top-level `UNION ALL` inside the
+// fragment, which is legal precisely because the template wraps it in brackets —
+// how deep a fragment lands is a property of the template, not the fragment.
+//
+// Note what these do *not* prove: a fragment's text never reaches `clause_map`,
+// so they cannot distinguish a correct clause map from a broken one. They pin the
+// emitted SQL for shapes that must keep working.
+
+const CTE: SqlFragment =
+    sql_fragment!("WITH active AS (SELECT id FROM u WHERE deleted_at IS NULL)");
+
+#[test]
+fn a_cte_fragment_heads_the_statement_and_leaves_the_predicate_alone() {
+    let x = Some(1i32);
+    assert_eq!(
+        query!("#{CTE} SELECT * FROM t WHERE a = ${?x}").sql(),
+        "WITH active AS (SELECT id FROM u WHERE deleted_at IS NULL) \
+         SELECT * FROM t WHERE a = $1"
+    );
+    let x: Option<i32> = None;
+    assert_eq!(
+        query!("#{CTE} SELECT * FROM t WHERE a = ${?x}").sql(),
+        "WITH active AS (SELECT id FROM u WHERE deleted_at IS NULL) SELECT * FROM t"
+    );
+}
+
+#[test]
+fn a_cte_bodys_where_does_not_open_a_clause_for_the_outer_predicates() {
+    // If the CTE's own `WHERE` were counted, the first optional would land in a
+    // later clause than the `WHERE` that introduces it, and `b` would join with
+    // a dangling `AND` once `a` dropped.
+    let a: Option<i32> = None;
+    let b = Some(2i32);
+    assert_eq!(
+        query!("#{CTE} SELECT * FROM t WHERE a = ${?a} AND b = ${?b}").sql(),
+        "WITH active AS (SELECT id FROM u WHERE deleted_at IS NULL) \
+         SELECT * FROM t WHERE b = $1"
+    );
+}
+
+#[test]
+fn a_recursive_cte_fragment_keeps_its_union_nested() {
+    const TREE: SqlFragment = sql_fragment!(
+        "WITH RECURSIVE tree AS (\
+             SELECT id FROM t WHERE parent IS NULL \
+             UNION ALL \
+             SELECT c.id FROM t c JOIN tree ON c.parent = tree.id\
+         )"
+    );
+    let x = Some(1i32);
+    assert_eq!(
+        query!("#{TREE} SELECT * FROM tree WHERE id = ${?x}").sql(),
+        "WITH RECURSIVE tree AS (SELECT id FROM t WHERE parent IS NULL \
+         UNION ALL SELECT c.id FROM t c JOIN tree ON c.parent = tree.id) \
+         SELECT * FROM tree WHERE id = $1"
+    );
+    let x: Option<i32> = None;
+    assert_eq!(
+        query!("#{TREE} SELECT * FROM tree WHERE id = ${?x}").sql(),
+        "WITH RECURSIVE tree AS (SELECT id FROM t WHERE parent IS NULL \
+         UNION ALL SELECT c.id FROM t c JOIN tree ON c.parent = tree.id) \
+         SELECT * FROM tree"
+    );
+}
+
+#[test]
+fn a_cte_body_with_its_own_having_leaves_the_outer_having_separate() {
+    const COUNTS: SqlFragment = sql_fragment!(
+        "WITH counts AS (SELECT k, count(*) n FROM t GROUP BY k HAVING count(*) > 1)"
+    );
+    // The nested `HAVING` must not be mistaken for the statement's own, or the
+    // outer `HAVING` predicate would be bookkept against the CTE's clause.
+    let n: Option<i64> = Some(5);
+    assert_eq!(
+        query!("#{COUNTS} SELECT k FROM counts GROUP BY k HAVING sum(n) > ${?n}").sql(),
+        "WITH counts AS (SELECT k, count(*) n FROM t GROUP BY k HAVING count(*) > 1) \
+         SELECT k FROM counts GROUP BY k HAVING sum(n) > $1"
+    );
+    let n: Option<i64> = None;
+    assert_eq!(
+        query!("#{COUNTS} SELECT k FROM counts GROUP BY k HAVING sum(n) > ${?n}").sql(),
+        "WITH counts AS (SELECT k, count(*) n FROM t GROUP BY k HAVING count(*) > 1) \
+         SELECT k FROM counts GROUP BY k"
+    );
+}
+
+#[test]
+fn a_cte_fragment_composes_with_a_predicate_fragment() {
+    let x: Option<i32> = None;
+    assert_eq!(
+        query!("#{CTE} SELECT * FROM t WHERE a = ${?x} AND #{ACTIVE}").sql(),
+        "WITH active AS (SELECT id FROM u WHERE deleted_at IS NULL) \
+         SELECT * FROM t WHERE deleted_at IS NULL"
+    );
+}
+
+#[test]
+fn a_cte_body_can_itself_be_the_fragment() {
+    // The reusable half is the body; the template supplies `WITH .. AS (..)`.
+    // Its `UNION ALL` is top-level *within the fragment*, so a check that
+    // rejected boundaries outright would reject this valid composition.
+    const BODY: SqlFragment = sql_fragment!(
+        "SELECT id FROM t WHERE parent IS NULL \
+         UNION ALL \
+         SELECT c.id FROM t c JOIN tree ON c.parent = tree.id"
+    );
+    let x = Some(1i32);
+    assert_eq!(
+        query!("WITH RECURSIVE tree AS (#{BODY}) SELECT * FROM tree WHERE id = ${?x}").sql(),
+        "WITH RECURSIVE tree AS (SELECT id FROM t WHERE parent IS NULL \
+         UNION ALL SELECT c.id FROM t c JOIN tree ON c.parent = tree.id) \
+         SELECT * FROM tree WHERE id = $1"
+    );
+    let x: Option<i32> = None;
+    assert_eq!(
+        query!("WITH RECURSIVE tree AS (#{BODY}) SELECT * FROM tree WHERE id = ${?x}").sql(),
+        "WITH RECURSIVE tree AS (SELECT id FROM t WHERE parent IS NULL \
+         UNION ALL SELECT c.id FROM t c JOIN tree ON c.parent = tree.id) \
+         SELECT * FROM tree"
+    );
+}
+
+#[test]
+fn a_subquery_body_fragment_keeps_the_outer_predicates_intact() {
+    // Same shape, one level down: the fragment is an `IN (...)` body.
+    const IDS: SqlFragment =
+        sql_fragment!("SELECT id FROM u WHERE active UNION SELECT id FROM v");
+    let a: Option<i32> = None;
+    let b = Some(2i32);
+    assert_eq!(
+        query!("SELECT * FROM t WHERE id IN (#{IDS}) AND a = ${?a} AND b = ${?b}").sql(),
+        "SELECT * FROM t WHERE id IN (SELECT id FROM u WHERE active \
+         UNION SELECT id FROM v) AND b = $1"
+    );
+}
+
+// --- the documented limit: a fragment that opens a top-level clause ---
+//
+// These tests pin the *broken* output, not the desired one. They exist so the
+// limit is demonstrable rather than folk knowledge, and so that a future fix
+// announces itself by failing here.
+//
+// `SqlFragment::new` is used deliberately: `sql_fragment!` cannot reject this
+// (how deep a fragment lands is up to the template, so a `UNION` inside one is
+// legal — see `a_cte_body_can_itself_be_the_fragment`), and `new` is the
+// documented escape hatch.
+
+#[test]
+fn a_fragment_opening_a_top_level_clause_breaks_the_joiner() {
+    // The `UNION` inside the fragment starts a second select. The template
+    // scanner never saw it, so `q` is bookkept against the first select's
+    // clause, which the mandatory `WHERE` already opened -> it emits the
+    // written `AND`. The second select needs its own `WHERE`.
+    // A plausible mistake: the fragment carries a predicate *and* the query's
+    // shape, instead of just the predicate.
+    const BAD: SqlFragment =
+        SqlFragment::new("deleted_at IS NULL UNION SELECT x FROM u");
+    let p: Option<i32> = None;
+    let q = Some(2i32);
+    assert_eq!(
+        query!("SELECT x FROM t WHERE a = ${?p} AND #{BAD} AND b = ${?q}").sql(),
+        // Invalid SQL: PostgreSQL rejects `FROM u AND b = $1`.
+        "SELECT x FROM t WHERE deleted_at IS NULL UNION SELECT x FROM u AND b = $1"
+    );
+}
+
+#[test]
+fn the_same_boundary_in_the_template_is_handled_correctly() {
+    // The workaround, and why it is not a downgrade: the fragment keeps the
+    // reusable predicate while the template owns the query's shape, so the same
+    // predicate can be applied on *both* sides of the boundary. `q` then belongs
+    // to the second select's clause and correctly supplies its `WHERE`.
+    let p: Option<i32> = None;
+    let q = Some(2i32);
+    assert_eq!(
+        query!(
+            "SELECT x FROM t WHERE a = ${?p} AND #{ACTIVE} \
+             UNION SELECT x FROM u WHERE #{ACTIVE} AND b = ${?q}"
+        )
+        .sql(),
+        "SELECT x FROM t WHERE deleted_at IS NULL \
+         UNION SELECT x FROM u WHERE deleted_at IS NULL AND b = $1"
+    );
+    // Both surviving: the first select's predicate keeps its own `AND`.
+    let p = Some(1i32);
+    assert_eq!(
+        query!(
+            "SELECT x FROM t WHERE a = ${?p} AND #{ACTIVE} \
+             UNION SELECT x FROM u WHERE #{ACTIVE} AND b = ${?q}"
+        )
+        .sql(),
+        "SELECT x FROM t WHERE a = $1 AND deleted_at IS NULL \
+         UNION SELECT x FROM u WHERE deleted_at IS NULL AND b = $2"
+    );
+}
+
+#[test]
+fn a_fragment_boundary_is_harmless_without_optional_predicates() {
+    // Nothing to bookkeep: with no `${?...}` in the template, every push is
+    // unconditional and the fragment's own structure is the author's business.
+    const BAD: SqlFragment =
+        SqlFragment::new("deleted_at IS NULL UNION SELECT x FROM u");
+    assert_eq!(
+        query!("SELECT x FROM t WHERE #{BAD}").sql(),
+        "SELECT x FROM t WHERE deleted_at IS NULL UNION SELECT x FROM u"
+    );
+}

@@ -234,6 +234,9 @@ Two deliberate routes stay open by design.
 
 - `SqlFragment::new(s.leak())`. `str::leak` is safe stable Rust. Closing this
   route would mean rejecting `&'static str`, the only thing a fragment holds.
+  Being a `const fn`, `new` also cannot run the bracket check that
+  `sql_fragment!` applies ("Fragments and optional predicates" below). Prefer
+  the macro.
 - `builder_mut().push(s)`. `QueryBuilder::push` takes `impl Display`. The
   escape hatch keeps unusual SQL expressible.
 
@@ -250,6 +253,110 @@ you would `unsafe`. Untrusted text belongs in `${expr}`.
 | `sql_fragment!(literal)` | `SqlFragment` from a string literal |
 | `SqlFragment`            | the raw-SQL type                    |
 | `SqlFragmentLike`        | its sealed trait                    |
+
+### Fragments and optional predicates
+
+A `#{...}` marker is opaque to the template scanner. It sees the marker, never
+the SQL the fragment will supply — the fragment may be a `const`, a function
+call, or a `match` arm chosen at runtime. Clause bookkeeping for `${?...}` is
+therefore built from the template alone.
+
+`sql_fragment!` checks one thing: that the fragment's brackets balance within
+it. An unmatched bracket is not just broken SQL of the author's own making — it
+reaches into the *template's* nesting, where a `)` can close a construct the
+fragment never opened. `sql_fragment!("a = 1) AND (b = 2")` is rejected at
+compile time even though its bracket counts match.
+
+Clause keywords are **not** checked, because they cannot be judged from the
+fragment alone. How deep a fragment lands is a property of the template:
+
+```rust
+// The body is the reusable half; the template supplies the brackets.
+const TREE: SqlFragment = sql_fragment!(
+    "SELECT id FROM t WHERE parent IS NULL \
+     UNION ALL \
+     SELECT c.id FROM t c JOIN tree ON c.parent = tree.id"
+);
+query!("WITH RECURSIVE tree AS (#{TREE}) SELECT * FROM tree WHERE id = ${?id}");
+```
+
+That `UNION ALL` is top-level within the fragment and nested once the template
+wraps it, so rejecting it would be a false rejection of valid SQL.
+
+The consequence is a constraint this crate documents rather than enforces:
+
+> A fragment used in a template that also contains `${?...}` must not introduce
+> a **top-level** clause boundary — `UNION`, `INTERSECT`, `EXCEPT`, `HAVING`,
+> `QUALIFY` or `;` — at the depth the template inserts it.
+
+#### What goes wrong
+
+The boundary opens a predicate list the template never counted, so the next
+optional predicate is bookkept against the wrong clause:
+
+```rust
+const F: SqlFragment = SqlFragment::new("deleted_at IS NULL UNION SELECT x FROM u");
+query!("SELECT x FROM t WHERE a = ${?p} AND #{F} AND b = ${?q}").sql();
+
+// p = None, q = Some(2):
+// SELECT x FROM t WHERE deleted_at IS NULL UNION SELECT x FROM u AND b = $1
+//                       ^^^^^ first select                       ^^^^^^^^^
+//                                             second select: needs WHERE, got AND
+```
+
+The `UNION` starts a second select whose `WHERE` has not been written yet, but
+the macro thinks `b` still belongs to the first select — where the mandatory
+`WHERE` is already emitted — so it joins with the written `AND`.
+
+#### How to recognise it
+
+Three signals, in order of how early you see them:
+
+1. `.sql()` shows a clause keyword coming *from a fragment* with an `AND`/`OR`
+   after it that has no `WHERE` in between.
+2. PostgreSQL fails with a syntax error at or after the boundary. It never
+   returns wrong rows for this — the statement does not parse.
+3. It appears only for some `Option` combinations: all-`Some` or all-`None`
+   often produce valid SQL, and one mixed case does not.
+
+#### How to fix it
+
+A fragment is for the part you reuse — a predicate, an ordering, a join. The
+query's *shape*, including any `UNION`, belongs in the template. Splitting it
+that way makes the fragment more useful, not less: the same predicate can then
+apply on both sides of the boundary.
+
+```rust
+// Before: the fragment carries both a predicate and the query's shape, so the
+// scanner cannot see the UNION and `q` gets the wrong joiner.
+const F: SqlFragment = SqlFragment::new("deleted_at IS NULL UNION SELECT x FROM u");
+query!("SELECT x FROM t WHERE a = ${?p} AND #{F} AND b = ${?q}");
+
+// After: the template owns the UNION; the fragment is just the predicate, and
+// it is reused in both selects.
+const ACTIVE: SqlFragment = sql_fragment!("deleted_at IS NULL");
+query!("SELECT x FROM t WHERE a = ${?p} AND #{ACTIVE} \
+        UNION SELECT x FROM u WHERE #{ACTIVE} AND b = ${?q}");
+// p = None, q = Some(2):
+// SELECT x FROM t WHERE deleted_at IS NULL
+//   UNION SELECT x FROM u WHERE deleted_at IS NULL AND b = $1
+```
+
+If a fragment genuinely must carry a boundary — a generated statement, say —
+drop `${?...}` from that template: with plain binds `${...}` there is no
+bookkeeping to invalidate. Or assemble that query with `builder_mut()`.
+
+Two cases that look similar but are fine:
+
+- **A fragment's own leading `WHERE`** — `sql_fragment!("WHERE x = 1")` opens the
+  very clause the surrounding predicates already belong to, so bookkeeping and
+  SQL agree.
+- **A boundary nested in brackets** — a subquery or CTE body keeps the
+  template's top-level clause count unchanged. That is why `sql_fragment!` does
+  not reject boundaries at all.
+
+Both are pinned by tests in `tests/optional.rs`, alongside the broken case
+above.
 
 Each macro returns a wrapper (`DynQuery`, `DynQueryAs<T>`, `DynQueryScalar`)
 with consuming `fetch_all` / `fetch_one` / `fetch_optional` / `execute` methods
@@ -388,8 +495,8 @@ The injection model is tested from both sides:
   needs no daemon:
 
   ```sh
-  cargo test                     # 186 tests, no Docker
-  cargo test --features e2e      # + 15 tests against a real server
+  cargo test                     # 233 tests, no Docker
+  cargo test --features e2e      # + 16 tests against a real server
   ```
 
   This is the only layer that proves the generated SQL is valid PostgreSQL
@@ -420,4 +527,4 @@ assemble by hand. That is where the difference shows first.
 
 ## License
 
-MIT OR Apache-2.0
+MIT

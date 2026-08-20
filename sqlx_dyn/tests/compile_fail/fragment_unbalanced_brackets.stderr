@@ -1,0 +1,7 @@
+error: this SQL fragment's brackets do not close within it.
+       A fragment is spliced verbatim into the `query!` template, so an unmatched bracket reaches into the template's own nesting: a `)` can close a construct the fragment never opened.
+       Balance the brackets inside the fragment, or move the surrounding bracket into the template.
+ --> tests/compile_fail/fragment_unbalanced_brackets.rs:8:28
+  |
+8 |     let _f = sql_fragment!("a = 1) AND (b = 2");
+  |                            ^^^^^^^^^^^^^^^^^^^

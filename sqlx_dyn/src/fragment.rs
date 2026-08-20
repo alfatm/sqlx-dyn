@@ -12,6 +12,12 @@ use std::borrow::Cow;
 
 /// A SQL fragment: text interpolated as SQL *syntax*.
 ///
+/// ```
+/// use sqlx_dyn::{sql_fragment, SqlFragment};
+/// const ACTIVE: SqlFragment = sql_fragment!("deleted_at IS NULL");
+/// assert_eq!(ACTIVE.as_str(), "deleted_at IS NULL");
+/// ```
+///
 /// Build one via [`sql_fragment!`](crate::sql_fragment) or
 /// [`SqlFragment::new`]; both require a `&'static str`. Neither constructor
 /// accepts a runtime `String`, so a fragment cannot accidentally carry user
@@ -28,6 +34,17 @@ pub struct SqlFragment(Cow<'static, str>);
 
 impl SqlFragment {
     /// Wraps a static SQL string. Callable in `const`, never allocates.
+    ///
+    /// Unlike [`sql_fragment!`](crate::sql_fragment), this does **not** check
+    /// that the brackets balance: being `const fn`, it cannot. An unmatched
+    /// bracket reaches into the `query!` template's own nesting, where a `)`
+    /// can close a construct the fragment never opened. Prefer
+    /// `sql_fragment!`, which rejects that at compile time; this is the same
+    /// kind of marked-not-enforced boundary as `str::leak` described above.
+    ///
+    /// Neither constructor checks clause keywords — see the crate-level
+    /// "Fragments and optional predicates" section for the constraint that
+    /// applies to both.
     pub const fn new(sql: &'static str) -> Self {
         Self(Cow::Borrowed(sql))
     }
@@ -69,21 +86,6 @@ impl<T: SqlFragmentLike + ?Sized> SqlFragmentLike for &T {
     fn as_sql(&self) -> &str {
         (**self).as_sql()
     }
-}
-
-/// Builds a [`SqlFragment`] from a string literal.
-///
-/// ```
-/// use sqlx_dyn::{sql_fragment, SqlFragment};
-/// const ACTIVE: SqlFragment = sql_fragment!("deleted_at IS NULL");
-/// ```
-///
-/// Only literals are accepted, so runtime data cannot be passed to the macro.
-#[macro_export]
-macro_rules! sql_fragment {
-    ($sql:literal) => {
-        $crate::SqlFragment::new($sql)
-    };
 }
 
 #[cfg(test)]

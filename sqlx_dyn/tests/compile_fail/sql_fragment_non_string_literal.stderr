@@ -1,0 +1,5 @@
+error: expected string literal
+ --> tests/compile_fail/sql_fragment_non_string_literal.rs:7:28
+  |
+7 |     let _f = sql_fragment!(42);
+  |                            ^^

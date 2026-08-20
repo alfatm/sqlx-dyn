@@ -1,11 +1,5 @@
-error: no rules expected `runtime_string`
+error: expected string literal
  --> tests/compile_fail/sql_fragment_non_literal.rs:7:28
   |
 7 |     let _f = sql_fragment!(runtime_string);
-  |                            ^^^^^^^^^^^^^^ no rules expected this token in macro call
-  |
-note: while trying to match meta-variable `$sql:literal`
- --> src/fragment.rs
-  |
-  |     ($sql:literal) => {
-  |      ^^^^^^^^^^^^
+  |                            ^^^^^^^^^^^^^^

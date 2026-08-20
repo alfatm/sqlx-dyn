@@ -2,7 +2,7 @@
 
 mod parse;
 
-use parse::{parse_template, Part};
+use parse::{fragment_brackets_unbalanced, parse_template, Part};
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::quote;
@@ -49,6 +49,37 @@ pub fn query_scalar(input: TokenStream) -> TokenStream {
         quote! { ::sqlx_dyn::DynQueryScalar::new(__sqlx_dyn_builder) },
     )
     .into()
+}
+
+/// `sql_fragment!("a = 1")`
+///
+/// Validates the literal and expands to `SqlFragment::new`, which is `const`,
+/// so the result stays usable in a `const` item.
+///
+/// Only string literals are accepted, so runtime data cannot reach a fragment
+/// through this macro. The text is also checked for balanced brackets — see
+/// [`parse::fragment_brackets_unbalanced`] for why that one property is
+/// enforced and clause keywords are not.
+#[proc_macro]
+pub fn sql_fragment(input: TokenStream) -> TokenStream {
+    let lit = match syn::parse::<LitStr>(input) {
+        Ok(lit) => lit,
+        Err(err) => return err.to_compile_error().into(),
+    };
+    if fragment_brackets_unbalanced(&lit.value()) {
+        return syn::Error::new(
+            lit.span(),
+            "this SQL fragment's brackets do not close within it.\n\
+             A fragment is spliced verbatim into the `query!` template, so an \
+             unmatched bracket reaches into the template's own nesting: a `)` \
+             can close a construct the fragment never opened.\n\
+             Balance the brackets inside the fragment, or move the surrounding \
+             bracket into the template.",
+        )
+        .to_compile_error()
+        .into();
+    }
+    quote! { ::sqlx_dyn::SqlFragment::new(#lit) }.into()
 }
 
 struct TypedInput {

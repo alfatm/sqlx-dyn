@@ -175,6 +175,84 @@
 //! For conditions that do not fit this shape, use a plain bind `${...}` or
 //! reach for `builder_mut()` and append by hand.
 //!
+//! ## Fragments and optional predicates
+//!
+//! A `#{...}` marker is opaque to the template scanner: it sees the marker, not
+//! the SQL the fragment supplies, which may be chosen at runtime. Clause
+//! bookkeeping for `${?...}` is therefore built from the template alone.
+//!
+//! [`sql_fragment!`] checks that a fragment's brackets balance within it — an
+//! unmatched bracket reaches into the *template's* nesting, where a `)` can
+//! close a construct the fragment never opened. Clause keywords are not
+//! checked, because how deep a fragment lands is a property of the template:
+//!
+//! ```
+//! # use sqlx_dyn::{query, sql_fragment, SqlFragment};
+//! # let id = Some(1i32);
+//! // Top-level within the fragment, nested once the template wraps it.
+//! const TREE: SqlFragment = sql_fragment!(
+//!     "SELECT id FROM t WHERE parent IS NULL \
+//!      UNION ALL \
+//!      SELECT c.id FROM t c JOIN tree ON c.parent = tree.id"
+//! );
+//! query!("WITH RECURSIVE tree AS (#{TREE}) SELECT * FROM tree WHERE id = ${?id}");
+//! ```
+//!
+//! Hence a constraint this crate documents rather than enforces: **a fragment
+//! used alongside `${?...}` must not introduce a top-level clause boundary** —
+//! `UNION`, `INTERSECT`, `EXCEPT`, `HAVING`, `QUALIFY` or `;` — at the depth the
+//! template inserts it.
+//!
+//! Break it and the boundary opens a predicate list the template never counted:
+//!
+//! ```
+//! # use sqlx_dyn::{query, SqlFragment};
+//! let p: Option<i32> = None;
+//! let q = Some(2i32);
+//! // The fragment carries a predicate *and* the query's shape — the mistake.
+//! const F: SqlFragment =
+//!     SqlFragment::new("deleted_at IS NULL UNION SELECT x FROM u");
+//! assert_eq!(
+//!     query!("SELECT x FROM t WHERE a = ${?p} AND #{F} AND b = ${?q}").sql(),
+//!     // The `UNION` starts a second select whose `WHERE` was never written,
+//!     // but `q` is bookkept against the first select's clause — already
+//!     // opened — so it joins with the written `AND`. PostgreSQL rejects this.
+//!     "SELECT x FROM t WHERE deleted_at IS NULL UNION SELECT x FROM u AND b = $1"
+//! );
+//! ```
+//!
+//! Symptoms: a clause keyword arriving from a fragment with an `AND`/`OR` after
+//! it and no `WHERE` in between; a PostgreSQL syntax error at the boundary; and
+//! only for *some* `Option` combinations, since all-`Some` and all-`None` often
+//! stay valid. The statement never parses, so it cannot silently match other
+//! rows.
+//!
+//! A fragment is for the part you reuse — a predicate, an ordering, a join. The
+//! query's *shape*, `UNION` included, belongs in the template. Split that way
+//! the fragment becomes more useful: the same predicate applies on both sides
+//! of the boundary.
+//!
+//! ```
+//! # use sqlx_dyn::{query, sql_fragment, SqlFragment};
+//! let p: Option<i32> = None;
+//! let q = Some(2i32);
+//! const ACTIVE: SqlFragment = sql_fragment!("deleted_at IS NULL");
+//! assert_eq!(
+//!     query!("SELECT x FROM t WHERE a = ${?p} AND #{ACTIVE} \
+//!             UNION SELECT x FROM u WHERE #{ACTIVE} AND b = ${?q}").sql(),
+//!     "SELECT x FROM t WHERE deleted_at IS NULL \
+//!      UNION SELECT x FROM u WHERE deleted_at IS NULL AND b = $1"
+//! );
+//! ```
+//!
+//! If a fragment genuinely must carry a boundary, drop `${?...}` from that
+//! template: with plain binds `${...}` there is no bookkeeping to invalidate.
+//!
+//! Two cases that look similar and are fine: a fragment's own leading `WHERE`
+//! (it opens the very clause the surrounding predicates already belong to), and
+//! a boundary nested in brackets (a subquery or CTE body leaves the template's
+//! top-level clause count unchanged).
+//!
 //! # Scalar type selection
 //!
 //! `query_scalar!` takes no type argument; the column type is pinned at the
@@ -219,7 +297,7 @@ mod query;
 pub use fragment::{SqlFragment, SqlFragmentLike};
 pub use query::{DynQuery, DynQueryAs, DynQueryScalar};
 
-pub use sqlx_dyn_macros::{query, query_as, query_scalar};
+pub use sqlx_dyn_macros::{query, query_as, query_scalar, sql_fragment};
 
 /// Implementation detail: a re-export so generated code does not require the
 /// caller to have `sqlx` in scope. Not a stable API.

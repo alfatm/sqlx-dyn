@@ -257,6 +257,51 @@ pub fn parse_template(input: &str, span: Span) -> Result<Vec<Part>, ParseError> 
 const CLAUSE_BOUNDARIES: [&str; 6] =
     ["WHERE", "HAVING", "UNION", "INTERSECT", "EXCEPT", "QUALIFY"];
 
+/// Whether a fragment's brackets fail to balance within it.
+///
+/// A fragment is spliced verbatim into the template, so an unmatched `(` or `)`
+/// does not just break the fragment's own SQL — it reaches into the template's
+/// nesting, where a `)` can close a construct the fragment never opened and the
+/// clause map is built on brackets the final SQL does not have. `a = 1) AND (b =
+/// 2` is the shape: bracket counts balance, yet the first `)` closes the
+/// template's.
+///
+/// Nothing else is checked. In particular a fragment *may* contain `UNION`,
+/// `HAVING` and friends: how deep the fragment lands is a property of the
+/// template, not of the fragment, so the two cannot be judged apart. A body
+/// like `SELECT .. UNION ALL SELECT ..` is exactly what belongs in
+/// `WITH t AS (#{body})`, and rejecting it here would be a false rejection of
+/// valid SQL. The cost is documented instead: a fragment that introduces a
+/// *top-level* clause boundary breaks `${?...}` bookkeeping — see the
+/// "fragments and optional predicates" section of the crate docs. That produces
+/// SQL Postgres rejects, not SQL that silently means something else.
+///
+/// Brackets are matched on the [`strip_literals`] view, so a bracket inside a
+/// string literal or a dollar-quoted body is data and does not count.
+///
+/// Returns `true` when the fragment must be rejected.
+pub fn fragment_brackets_unbalanced(sql: &str) -> bool {
+    let bytes = strip_literals(sql).into_bytes();
+    let mut depth = 0i32;
+
+    for b in bytes {
+        match b {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                // Negative means this `)` closes a bracket belonging to the
+                // template. Checking only the final balance would pass
+                // `a = 1) AND (b = 2`.
+                if depth < 0 {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth != 0
+}
+
 /// Assigns a clause index to every byte offset of the template.
 ///
 /// Index 0 covers everything before the first predicate list; each boundary
@@ -296,6 +341,17 @@ fn clause_map(upper: &str) -> Vec<(usize, u32)> {
                 while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                     i += 1;
                 }
+                // The `depth == 0` guard currently has no *observable* effect,
+                // and that is a coincidence of how introducers are built, not a
+                // reason to drop it. Codegen records an introducer only for a
+                // predicate whose own joiner is `WHERE`/`HAVING`; a predicate
+                // separated from an earlier one by a nested boundary always
+                // carries the written `AND` instead, so its clause has no
+                // introducer either way and `open` emits `AND` in both. Deleting
+                // this guard therefore fails no test in the suite. It becomes
+                // load-bearing again the moment an introducer can be recorded
+                // for a clause a nested boundary opened — so keep it, and do not
+                // read the passing suite as evidence it is dead.
                 if depth == 0 && CLAUSE_BOUNDARIES.contains(&&upper[start..i]) {
                     clause += 1;
                     // The keyword itself belongs to the clause it opens, so a
@@ -553,9 +609,13 @@ fn find_comment(sql: &str) -> Option<usize> {
 
 /// Keywords that end the predicate the marker sits in. Everything from one of
 /// them onward is mandatory SQL, never part of the optional predicate.
-const CLAUSE_ENDS: [&str; 10] = [
+/// `FOR` covers the locking clauses (`FOR UPDATE`, `FOR SHARE`); `ON` covers
+/// `ON CONFLICT`. Both are safe to list only because the scan runs over the
+/// [`strip_literals`] view: on raw text, every keyword here is also a false
+/// positive waiting inside some string literal.
+const CLAUSE_ENDS: [&str; 13] = [
     "GROUP", "ORDER", "LIMIT", "OFFSET", "HAVING", "UNION", "INTERSECT", "EXCEPT",
-    "RETURNING", "FETCH",
+    "RETURNING", "FETCH", "FOR", "WINDOW", "ON",
 ];
 
 /// Captures the part of the predicate sitting *right* of the marker, e.g. the
@@ -569,6 +629,11 @@ const CLAUSE_ENDS: [&str; 10] = [
 /// construct. Returns the tail's byte length within `rest`, excluding any
 /// trailing whitespace — that belongs to the mandatory text, so the separator
 /// before the next keyword survives a dropped predicate.
+///
+/// Every token above is recognised on the [`strip_literals`] view, never on raw
+/// text: a `)` or an `AND` inside a string literal, a quoted identifier or a
+/// dollar-quoted body is data, and stopping there would cut the predicate
+/// mid-literal — emitting a dangling joiner and an unterminated quote.
 fn predicate_tail(rest: &str) -> usize {
     // Never scan past another interpolation: its text is not ours, and
     // swallowing it would silently turn a bind into literal SQL — or worse, cut
@@ -576,7 +641,9 @@ fn predicate_tail(rest: &str) -> usize {
     // a live marker, yielding SQL that Postgres accepts with the wrong string
     // inside.
     let limit = next_marker(rest).unwrap_or(rest.len());
-    let end = predicate_tail_end(&rest[..limit]).min(limit);
+    // Offsets in the stripped view index `rest` unchanged, so the end found
+    // there cuts the original bytes.
+    let end = predicate_tail_end(&strip_literals(&rest[..limit])).min(limit);
     rest[..end].trim_end().len()
 }
 
@@ -591,9 +658,18 @@ fn tail_is_truncated_by_escape(rest: &str, tail: usize) -> bool {
     if !(trimmed.starts_with("$${") || trimmed.starts_with("##{")) {
         return false;
     }
-    // An odd number of quotes in the captured tail means the literal it opened
-    // closes only after the escape, so the escape is inside this predicate.
-    rest[..tail].bytes().filter(|b| *b == b'\'').count() % 2 == 1
+    // A literal left open at the end of the captured tail closes only after the
+    // escape, so the escape is inside this predicate. `strip_literals` blanks a
+    // literal's bytes and runs an unterminated one to the end of its input, so
+    // an open literal is exactly a blank final byte where the source is not
+    // whitespace. This covers `'...'`, `"..."` and `$tag$...$tag$` alike —
+    // counting `'` parity saw only the first.
+    let stripped = strip_literals(&rest[..tail]);
+    stripped
+        .bytes()
+        .zip(rest[..tail].bytes())
+        .next_back()
+        .is_some_and(|(out, src)| out == b' ' && !src.is_ascii_whitespace())
 }
 
 /// Offset of the next `${`/`#{` marker **or `$${`/`##{` escape**.
@@ -615,9 +691,12 @@ fn next_marker(rest: &str) -> Option<usize> {
 }
 
 /// Scans to the first byte past the predicate; see [`predicate_tail`].
-fn predicate_tail_end(rest: &str) -> usize {
-    let upper = rest.to_ascii_uppercase();
-    let bytes = upper.as_bytes();
+///
+/// Takes the [`strip_literals`] view of the tail, not the tail itself: keyword
+/// and bracket matching must not see literal data. Offsets are preserved by that
+/// view, so the returned index also indexes the source.
+fn predicate_tail_end(stripped: &str) -> usize {
+    let bytes = stripped.as_bytes();
     let mut i = 0;
 
     while i < bytes.len() {
@@ -638,12 +717,12 @@ fn predicate_tail_end(rest: &str) -> usize {
         {
             i += 1;
         }
-        let word = &upper[start..i];
+        let word = &stripped[start..i];
         if JOINERS.contains(&word) || CLAUSE_ENDS.contains(&word) {
             return start;
         }
     }
-    rest.len()
+    stripped.len()
 }
 
 /// Splits the SQL accumulated so far so the trailing predicate — the one the
@@ -927,6 +1006,69 @@ fn skip_char_literal(input: &str, start: usize) -> Option<usize> {
         Some(i + 1)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod fragment_checks {
+    use super::*;
+
+    #[test]
+    fn balanced_fragments_are_accepted() {
+        // Every fragment shipped in this repo's tests, examples and README,
+        // plus the CTE-body shape meant for `WITH t AS (#{body})`.
+        for sql in [
+            "deleted_at IS NULL",
+            "deleted_at IS NULL AND published",
+            "t.kind = 'template' AND t.deleted_at IS NULL",
+            "true",
+            "t.published",
+            "r.data->>'locale'",
+            "created_at DESC, id DESC",
+            "ORDER BY name ASC",
+            "LEFT JOIN profiles p ON p.user_id = u.id",
+            "CREATE DATABASE \"cms_test_fixed\"",
+            "'document'",
+            "a IN (SELECT x FROM u WHERE y = 1)",
+            "WITH active AS (SELECT id FROM u WHERE deleted_at IS NULL)",
+        ] {
+            assert!(!fragment_brackets_unbalanced(sql), "should accept {sql:?}");
+        }
+    }
+
+    #[test]
+    fn a_clause_boundary_is_not_rejected() {
+        // How deep a fragment lands is a property of the template, so a
+        // boundary cannot be judged from the fragment alone. A CTE body is the
+        // motivating case: it is top-level *within the fragment*, but the
+        // template wraps it in `WITH t AS (...)`.
+        for sql in [
+            "SELECT id FROM t WHERE parent IS NULL \
+             UNION ALL \
+             SELECT c.id FROM t c JOIN tree ON c.parent = tree.id",
+            "SELECT k, count(*) n FROM t GROUP BY k HAVING count(*) > 1",
+            "SELECT 1 EXCEPT SELECT 2",
+            "1 UNION SELECT * FROM u",
+            "x = 1; DELETE FROM u",
+        ] {
+            assert!(!fragment_brackets_unbalanced(sql), "should accept {sql:?}");
+        }
+    }
+
+    #[test]
+    fn unbalanced_brackets_are_rejected() {
+        // The middle case has equal counts, but its `)` closes the template's
+        // bracket before opening one of its own.
+        for sql in ["(a = 1", "a = 1)", "a = 1) AND (b = 2"] {
+            assert!(fragment_brackets_unbalanced(sql), "should reject {sql:?}");
+        }
+    }
+
+    #[test]
+    fn a_bracket_inside_a_literal_is_data() {
+        assert!(!fragment_brackets_unbalanced("note = '('"));
+        assert!(!fragment_brackets_unbalanced("note = $q$)$q$"));
+        assert!(!fragment_brackets_unbalanced("\"(\" = 1"));
     }
 }
 

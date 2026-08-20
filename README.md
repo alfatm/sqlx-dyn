@@ -346,6 +346,26 @@ If a fragment genuinely must carry a boundary — a generated statement, say —
 drop `${?...}` from that template: with plain binds `${...}` there is no
 bookkeeping to invalidate. Or assemble that query with `builder_mut()`.
 
+`sql_fragment!` **strips** SQL comments from a fragment. A comment annotates the
+fragment; it is not SQL the fragment contributes. Left in place, a trailing `--`
+would comment out the template text following the marker — PostgreSQL accepts
+that, and the query silently matches different rows.
+
+```rust
+const F: SqlFragment = sql_fragment!("c = 1 -- why");
+query!("SELECT * FROM t WHERE a = ${?x} AND #{F} AND b = 1");
+// -> SELECT * FROM t WHERE a = $1 AND c = 1 AND b = 1
+//    the comment is gone; `AND b = 1` survives
+```
+
+Comments are blanked to spaces, never deleted, so the tokens they separated stay
+separated: `c = 1/* note */AND d = 2` keeps its gap instead of collapsing into
+`1AND`. A `--` or `/*` inside a string literal or dollar-quoted body is data and
+passes through untouched.
+
+An **unterminated** `/*` is rejected rather than stripped: there is no end to
+strip up to, so it would swallow whatever follows the marker.
+
 `sql_fragment!` also rejects a fragment that *starts* with `AND`/`OR`, for the
 same reason: the joiner says how the fragment is combined, not what it is, and
 only the template can hand a dropped `WHERE` over to it. Write
@@ -463,7 +483,10 @@ network round trip.
 ## Scope
 
 PostgreSQL only. No compile-time SQL validation, no schema introspection, no
-`DATABASE_URL` at build time, no SQL parsing beyond locating `${`/`#{` markers.
+`DATABASE_URL` at build time. There is no SQL parser: the template is scanned
+only as far as `${?...}` demands — string literals, dollar-quoted bodies,
+comments, bracket depth and clause keywords — which is enough to decide what a
+dropped predicate takes with it, and nothing more.
 The public API is shaped so other `sqlx::Database` backends can be added later,
 but v1 does not abstract over them.
 
@@ -500,7 +523,7 @@ The injection model is tested from both sides:
   needs no daemon:
 
   ```sh
-  cargo test                     # 241 tests, no Docker
+  cargo test                     # 248 tests, no Docker
   cargo test --features e2e      # + 16 tests against a real server
   ```
 

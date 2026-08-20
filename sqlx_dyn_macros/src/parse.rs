@@ -257,29 +257,101 @@ pub fn parse_template(input: &str, span: Span) -> Result<Vec<Part>, ParseError> 
 const CLAUSE_BOUNDARIES: [&str; 6] =
     ["WHERE", "HAVING", "UNION", "INTERSECT", "EXCEPT", "QUALIFY"];
 
-/// Whether a fragment's brackets fail to balance within it.
+/// Blanks a fragment's SQL comments, or `None` when it has none.
 ///
-/// A fragment is spliced verbatim into the template, so an unmatched `(` or `)`
-/// does not just break the fragment's own SQL — it reaches into the template's
-/// nesting, where a `)` can close a construct the fragment never opened and the
-/// clause map is built on brackets the final SQL does not have. `a = 1) AND (b =
-/// 2` is the shape: bracket counts balance, yet the first `)` closes the
-/// template's.
+/// A template using `${?...}` may not contain a comment, because one can hide
+/// the joiner between two predicates and silently change which rows match. A
+/// fragment is opaque to that whole-template check, so a comment smuggled inside
+/// one reopens exactly the hole:
 ///
-/// Nothing else is checked. In particular a fragment *may* contain `UNION`,
-/// `HAVING` and friends: how deep the fragment lands is a property of the
-/// template, not of the fragment, so the two cannot be judged apart. A body
-/// like `SELECT .. UNION ALL SELECT ..` is exactly what belongs in
-/// `WITH t AS (#{body})`, and rejecting it here would be a false rejection of
-/// valid SQL. The cost is documented instead: a fragment that introduces a
-/// *top-level* clause boundary breaks `${?...}` bookkeeping — see the
-/// "fragments and optional predicates" section of the crate docs. That produces
-/// SQL Postgres rejects, not SQL that silently means something else.
+/// ```text
+/// const F: SqlFragment = sql_fragment!("c = 1 --");
+/// query!("SELECT * FROM t WHERE a = ${?x} AND #{F} AND b = 1")
+/// -> SELECT * FROM t WHERE a = $1 AND c = 1 -- AND b = 1
+/// ```
 ///
-/// Brackets are matched on the [`strip_literals`] view, so a bracket inside a
-/// string literal or a dollar-quoted body is data and does not count.
+/// `AND b = 1` is commented out and the query matches more rows than written.
+/// PostgreSQL accepts it, so nothing fails loudly.
 ///
-/// Returns `true` when the fragment must be rejected.
+/// A comment is a *comment about the fragment*, not SQL the fragment
+/// contributes, so it is blanked rather than rejected: the fragment keeps
+/// working and the hazard is gone. Blanked, never deleted — `1/*x*/AND` must not
+/// become `1AND`, so each comment byte becomes a space and the tokens it
+/// separated stay separated.
+///
+/// Literals are preserved: positions come from the [`strip_literals`] view, so
+/// `'--'` and `$tag$--$tag$` are data and pass through unchanged. An unclosed
+/// `/*` is a separate matter — see [`fragment_comment_unterminated`].
+pub fn fragment_comments_blanked(sql: &str) -> Option<String> {
+    // Comment positions are found on the stripped view, where a `--` inside a
+    // literal or a dollar-quoted body is already gone, then applied to the
+    // original so the literals themselves survive untouched. Offsets agree
+    // because `strip_literals` preserves them byte for byte.
+    let stripped = strip_literals(sql);
+    find_comment(&stripped)?;
+    let mask = blank_comments(&stripped);
+    let mut out = sql.as_bytes().to_vec();
+    for (i, b) in mask.bytes().enumerate() {
+        // A byte the mask blanked but the stripped view did not is comment text.
+        if b == b' ' && stripped.as_bytes()[i] != b' ' {
+            out[i] = b' ';
+        }
+    }
+    let blanked = String::from_utf8(out).expect("only ASCII spaces were written");
+    // Interior spacing must stay (it is what keeps `1/*x*/AND` from becoming
+    // `1AND`), but the fragment's own edges are a boundary: trimming them keeps
+    // the emitted SQL tidy and matches what the author would have written.
+    Some(blanked.trim().to_string())
+}
+
+/// Whether a fragment leaves a block comment unterminated.
+///
+/// An unclosed `/*` cannot be blanked away: it would comment out the template
+/// text that follows the marker, and there is no end for the blanking to stop
+/// at. `--` needs no such rule — a line comment is closed by the end of the
+/// fragment, and blanking it removes it entirely.
+///
+/// Matched on the [`strip_literals`] view, so a `/*` inside a literal is data.
+pub fn fragment_comment_unterminated(sql: &str) -> bool {
+    let stripped = strip_literals(sql);
+    let bytes = stripped.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'-' && bytes[i + 1..].starts_with(b"-") {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i] == b'/' && bytes[i + 1..].starts_with(b"*") {
+            let mut nesting = 0usize;
+            while i < bytes.len() {
+                if bytes[i] == b'/' && bytes[i + 1..].starts_with(b"*") {
+                    nesting += 1;
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == b'*' && bytes[i + 1..].starts_with(b"/") {
+                    nesting -= 1;
+                    i += 2;
+                    if nesting == 0 {
+                        break;
+                    }
+                    continue;
+                }
+                i += 1;
+            }
+            if nesting != 0 {
+                return true;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Whether a fragment starts with `AND`/`OR`, which the template must own.
 ///
 /// A fragment marker is opaque, so codegen cannot lift a joiner out of it the
@@ -312,6 +384,28 @@ pub fn fragment_starts_with_joiner(sql: &str) -> Option<&'static str> {
     })
 }
 
+/// Whether a fragment's brackets fail to balance within it.
+///
+/// A fragment is spliced verbatim into the template, so an unmatched `(` or `)`
+/// does not just break the fragment's own SQL — it reaches into the template's
+/// nesting, where a `)` can close a construct the fragment never opened and the
+/// clause map is built on brackets the final SQL does not have. `a = 1) AND (b =
+/// 2` is the shape: bracket counts balance, yet the first `)` closes the
+/// template's.
+///
+/// Clause keywords are deliberately *not* rejected: a fragment *may* contain
+/// `UNION`, `HAVING` and friends, because how deep the fragment lands is a
+/// property of the template, not of the fragment, so the two cannot be judged
+/// apart. A body like `SELECT .. UNION ALL SELECT ..` is exactly what belongs in
+/// `WITH t AS (#{body})`. The cost is documented instead — see the "fragments
+/// and optional predicates" section of the crate docs — and it produces SQL
+/// Postgres rejects, not SQL that silently means something else.
+///
+/// Brackets are matched on the comment-blanked [`strip_literals`] view, so a
+/// bracket inside a string literal, a dollar-quoted body or a SQL comment is
+/// data and does not count.
+///
+/// Returns `true` when the fragment must be rejected.
 pub fn fragment_brackets_unbalanced(sql: &str) -> bool {
     let bytes = blank_comments(&strip_literals(sql)).into_bytes();
     let mut depth = 0i32;
@@ -444,6 +538,16 @@ fn strip_literals(sql: &str) -> String {
             // in Postgres `E'...'` strings and under
             // `standard_conforming_strings = off` — a backslash escapes the next
             // character.
+            //
+            // This is the opposite choice from [`find_comment`], on purpose, and
+            // the two are not reconcilable: treating `\'` as one unit keeps an
+            // `E'a\'b'` literal intact but makes `'a\'` — a complete literal
+            // under the default `standard_conforming_strings = on` — run past its
+            // closing quote. Here that costs a false *rejection* (the template
+            // fails to compile), which is the safe direction; in `find_comment`
+            // the same choice would cost a false *negative* (a real comment
+            // swallowed), which is not. Known limitation: a literal ending in a
+            // backslash right before its closing quote may be rejected.
             q @ (b'\'' | b'"') => {
                 i += 1;
                 while i < bytes.len() {
@@ -672,6 +776,9 @@ const JOINERS: [&str; 4] = ["AND", "OR", "WHERE", "HAVING"];
 /// reject a valid template. That is a compile error on working SQL, never
 /// silently wrong SQL, and it matches how callers already prefer false
 /// rejections over false acceptances.
+///
+/// Note that [`strip_literals`] resolves the same ambiguity the other way; see
+/// the comment on its quote scan for why neither choice is right for both.
 fn find_comment(sql: &str) -> Option<usize> {
     let bytes = sql.as_bytes();
     let mut i = 0;
@@ -1197,6 +1304,61 @@ mod fragment_checks {
         for sql in ["(a = 1", "a = 1)", "a = 1) AND (b = 2"] {
             assert!(fragment_brackets_unbalanced(sql), "should reject {sql:?}");
         }
+    }
+
+    #[test]
+    fn a_closed_comment_is_blanked_not_deleted() {
+        // Deleting would glue the tokens the comment separated: `1/*x*/AND`
+        // must not become `1AND`.
+        assert_eq!(
+            fragment_comments_blanked("c = 1/*x*/AND d = 2").as_deref(),
+            Some("c = 1     AND d = 2")
+        );
+        assert_eq!(
+            fragment_comments_blanked("c = 1 /* x */ AND d = 2").as_deref(),
+            Some("c = 1         AND d = 2")
+        );
+        // Trailing comments leave nothing behind once the edges are trimmed.
+        assert_eq!(
+            fragment_comments_blanked("c = 1 -- trailing").as_deref(),
+            Some("c = 1")
+        );
+        assert_eq!(
+            fragment_comments_blanked("/* lead */ c = 1").as_deref(),
+            Some("c = 1")
+        );
+    }
+
+    #[test]
+    fn a_fragment_without_comments_is_left_alone() {
+        for sql in ["c = 1", "deleted_at IS NULL", "a = 1 AND b = 2"] {
+            assert_eq!(fragment_comments_blanked(sql), None, "{sql:?}");
+        }
+    }
+
+    #[test]
+    fn a_comment_marker_inside_a_literal_is_not_a_comment() {
+        // `strip_literals` runs first, so these are data and survive verbatim.
+        for sql in [
+            "s = '--'",
+            "s = $tag$--$tag$",
+            "s = '/*'",
+            "\"--\" = 1",
+        ] {
+            assert_eq!(fragment_comments_blanked(sql), None, "{sql:?}");
+            assert!(!fragment_comment_unterminated(sql), "{sql:?}");
+        }
+    }
+
+    #[test]
+    fn an_unterminated_block_comment_is_rejected() {
+        // No end to blank up to: it would swallow the template text after the
+        // marker.
+        assert!(fragment_comment_unterminated("c = 1 /* x"));
+        assert!(fragment_comment_unterminated("c = 1 /* a /* b */"));
+        // A line comment needs no such rule — the fragment's end closes it.
+        assert!(!fragment_comment_unterminated("c = 1 -- x"));
+        assert!(!fragment_comment_unterminated("c = 1 /* x */"));
     }
 
     #[test]

@@ -1,0 +1,7 @@
+error: this SQL fragment leaves a block comment unterminated.
+       A `#{...}` marker is opaque to the template scanner, so an unclosed `/*` comments out the template text that follows the marker and the query silently matches different rows. A closed comment is fine — it is stripped from the fragment.
+       Close the comment, or remove it.
+ --> tests/compile_fail/fragment_block_comment.rs:7:28
+  |
+7 |     let _f = sql_fragment!("c = 1 /* x");
+  |                            ^^^^^^^^^^^^

@@ -1557,3 +1557,43 @@ fn a_rust_comment_inside_an_interpolation_is_skipped() {
     assert_eq!(query!("SELECT ${/* nested /* } */ */ a}").sql(), "SELECT $1");
     assert_eq!(query!("SELECT ${\n// }\na}").sql(), "SELECT $1");
 }
+
+#[test]
+fn a_comment_in_a_fragment_is_blanked_out() {
+    // A template using `${?...}` may not contain a SQL comment; a fragment is
+    // opaque to that check, so a comment inside one used to comment out the
+    // template text after the marker. `sql_fragment!` now blanks it, so the
+    // fragment keeps working and the following text survives.
+    const NOTED: SqlFragment = sql_fragment!("c = 1 -- why");
+    let x = Some(1i32);
+    assert_eq!(
+        query!("SELECT * FROM t WHERE a = ${?x} AND #{NOTED} AND b = 1").sql(),
+        "SELECT * FROM t WHERE a = $1 AND c = 1 AND b = 1"
+    );
+    let x: Option<i32> = None;
+    assert_eq!(
+        query!("SELECT * FROM t WHERE a = ${?x} AND #{NOTED} AND b = 1").sql(),
+        "SELECT * FROM t WHERE c = 1 AND b = 1"
+    );
+}
+
+#[test]
+fn a_blanked_comment_still_separates_the_tokens_around_it() {
+    // Blanked, never deleted: `1/*x*/AND` must not become `1AND`.
+    const GLUED: SqlFragment = sql_fragment!("c = 1/* note */AND d = 2");
+    let x = Some(1i32);
+    assert_eq!(
+        query!("SELECT * FROM t WHERE a = ${?x} AND #{GLUED}").sql(),
+        "SELECT * FROM t WHERE a = $1 AND c = 1          AND d = 2"
+    );
+}
+
+#[test]
+fn a_comment_marker_inside_a_fragments_literal_survives() {
+    const KEPT: SqlFragment = sql_fragment!("s = '--' AND t = $q$/*$q$");
+    let x = Some(1i32);
+    assert_eq!(
+        query!("SELECT * FROM t WHERE a = ${?x} AND #{KEPT}").sql(),
+        "SELECT * FROM t WHERE a = $1 AND s = '--' AND t = $q$/*$q$"
+    );
+}

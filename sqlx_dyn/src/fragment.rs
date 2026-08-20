@@ -35,12 +35,21 @@ pub struct SqlFragment(Cow<'static, str>);
 impl SqlFragment {
     /// Wraps a static SQL string. Callable in `const`, never allocates.
     ///
-    /// Unlike [`sql_fragment!`](crate::sql_fragment), this does **not** check
-    /// that the brackets balance: being `const fn`, it cannot. An unmatched
-    /// bracket reaches into the `query!` template's own nesting, where a `)`
-    /// can close a construct the fragment never opened. Prefer
-    /// `sql_fragment!`, which rejects that at compile time; this is the same
-    /// kind of marked-not-enforced boundary as `str::leak` described above.
+    /// Being a `const fn`, this runs **none** of the checks
+    /// [`sql_fragment!`](crate::sql_fragment) applies. It accepts fragment text
+    /// that the macro rejects:
+    ///
+    /// - a SQL comment, which `sql_fragment!` strips; left in, it comments out
+    ///   the template text following the marker and silently changes which rows
+    ///   match — and an unterminated `/*`, which the macro rejects outright;
+    /// - a leading `AND`/`OR`, which is left dangling when the optional
+    ///   predicate before it drops;
+    /// - brackets that do not balance within the fragment, which reach into the
+    ///   template's own nesting.
+    ///
+    /// Prefer `sql_fragment!`. This is the same kind of marked-not-enforced
+    /// boundary as `str::leak` above: visible at the call site, so it does not
+    /// happen by accident.
     ///
     /// Neither constructor checks clause keywords — see the crate-level
     /// "Fragments and optional predicates" section for the constraint that

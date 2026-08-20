@@ -248,6 +248,16 @@
 //! If a fragment genuinely must carry a boundary, drop `${?...}` from that
 //! template: with plain binds `${...}` there is no bookkeeping to invalidate.
 //!
+//! [`sql_fragment!`] **strips** SQL comments from a fragment. A comment is a note
+//! about the fragment, not SQL it contributes, and left in place a trailing `--`
+//! would comment out the template text after the marker — PostgreSQL accepts
+//! that, and the query silently matches different rows. Comments are blanked to
+//! spaces rather than deleted, so `c = 1/* note */AND d = 2` does not collapse
+//! into `1AND`. `'--'` and `$tag$--$tag$` are data and pass through untouched.
+//!
+//! An *unterminated* `/*` is rejected instead: there is no end to strip up to,
+//! so it would swallow whatever follows the marker.
+//!
 //! For the same reason [`sql_fragment!`] rejects a fragment that *starts* with
 //! `AND`/`OR`. The joiner describes how the fragment is combined, not what it
 //! is, so it belongs in the template where the scanner can hand a dropped

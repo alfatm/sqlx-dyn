@@ -3,7 +3,8 @@
 mod parse;
 
 use parse::{
-    fragment_brackets_unbalanced, fragment_starts_with_joiner, parse_template, Part,
+    fragment_brackets_unbalanced, fragment_comment_unterminated, fragment_comments_blanked,
+    fragment_starts_with_joiner, parse_template, Part,
 };
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
@@ -59,15 +60,40 @@ pub fn query_scalar(input: TokenStream) -> TokenStream {
 /// so the result stays usable in a `const` item.
 ///
 /// Only string literals are accepted, so runtime data cannot reach a fragment
-/// through this macro. The text is also checked for balanced brackets — see
-/// [`parse::fragment_brackets_unbalanced`] for why that one property is
-/// enforced and clause keywords are not.
+/// through this macro. SQL comments are stripped from the text
+/// ([`parse::fragment_comments_blanked`]), and it is rejected if it leaves a
+/// block comment unterminated ([`parse::fragment_comment_unterminated`]), starts
+/// with `AND`/`OR` ([`parse::fragment_starts_with_joiner`]) or leaves brackets
+/// unbalanced ([`parse::fragment_brackets_unbalanced`]). Clause keywords are
+/// deliberately allowed; the last of those explains why.
 #[proc_macro]
 pub fn sql_fragment(input: TokenStream) -> TokenStream {
     let lit = match syn::parse::<LitStr>(input) {
         Ok(lit) => lit,
         Err(err) => return err.to_compile_error().into(),
     };
+    // An unclosed `/*` has no end to blank up to, and would comment out the
+    // template text after the marker. Nothing to salvage — reject it.
+    if fragment_comment_unterminated(&lit.value()) {
+        return syn::Error::new(
+            lit.span(),
+            "this SQL fragment leaves a block comment unterminated.\n\
+             A `#{...}` marker is opaque to the template scanner, so an unclosed \
+             `/*` comments out the template text that follows the marker and the \
+             query silently matches different rows. A closed comment is fine — \
+             it is stripped from the fragment.\n\
+             Close the comment, or remove it.",
+        )
+        .to_compile_error()
+        .into();
+    }
+    // A closed comment describes the fragment; it is not SQL the fragment
+    // contributes. Blank it here so it cannot escape the whole-template comment
+    // rule, and let the fragment keep working.
+    let value = lit.value();
+    let sql = fragment_comments_blanked(&value).unwrap_or(value);
+    let lit = LitStr::new(&sql, lit.span());
+
     if let Some(kw) = fragment_starts_with_joiner(&lit.value()) {
         return syn::Error::new(
             lit.span(),
@@ -77,7 +103,8 @@ pub fn sql_fragment(input: TokenStream) -> TokenStream {
                  A `#{{...}}` marker is opaque, so the macro cannot hand a \
                  dropped `WHERE` over to a joiner hidden inside the fragment. If \
                  the optional predicate before it is `None`, the `{kw}` is left \
-                 dangling: `WHERE a = ${{?x}} #{{F}}` becomes `FROM t {kw} b = 1`.\n\
+                 dangling: `SELECT * FROM t WHERE a = ${{?x}} #{{F}}` becomes \
+                 `SELECT * FROM t {kw} b = 1`.\n\
                  Write the joiner in the template instead: \
                  `WHERE a = ${{?x}} {kw} #{{F}}`."
             ),

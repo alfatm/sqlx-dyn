@@ -1,0 +1,5 @@
+error: empty interpolation `${}`
+ --> tests/compile_fail/empty_bind.rs:6:21
+  |
+6 |     let _q = query!("SELECT * FROM users WHERE id = ${}");
+  |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

@@ -1,0 +1,7 @@
+error: `${?...}` must sit in a predicate introduced by `WHERE`, `AND` or `OR`.
+       No such keyword precedes this marker, so there is no way to tell which SQL to remove when the value is `None`.
+       Use a plain bind `${...}` or restructure the query so the optional condition is its own `AND` clause.
+ --> tests/compile_fail/opt_in_select_list.rs:8:12
+  |
+8 |     query!("SELECT id, ${?extra} FROM t");
+  |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

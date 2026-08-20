@@ -1,0 +1,5 @@
+error: unterminated interpolation `${...}`: missing closing `}`
+ --> tests/compile_fail/unterminated_bind.rs:6:21
+  |
+6 |     let _q = query!("SELECT * FROM users WHERE id = ${id");
+  |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

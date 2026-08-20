@@ -1,0 +1,5 @@
+error: empty optional interpolation `${?}`
+ --> tests/compile_fail/opt_empty.rs:5:12
+  |
+5 |     query!("SELECT * FROM t WHERE a = ${?}");
+  |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

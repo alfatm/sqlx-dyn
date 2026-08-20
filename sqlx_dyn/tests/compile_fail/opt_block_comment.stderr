@@ -1,0 +1,7 @@
+error: SQL comments are not supported in a template using `${?...}`, but `/*` appears before the marker.
+       A comment can hide an `AND`/`OR` or swallow the predicate itself, silently changing which rows match.
+       Remove the comment or build this query without `${?...}`.
+ --> tests/compile_fail/opt_block_comment.rs:6:12
+  |
+6 |     query!("SELECT * FROM t WHERE a = 1 /* or */ AND col = ${?x}");
+  |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

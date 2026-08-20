@@ -1,0 +1,29 @@
+[package]
+name = "sqlx_dyn"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Ergonomic template macros over sqlx::QueryBuilder for PostgreSQL: bind parameters, sealed SQL fragments and optional predicates"
+repository = "https://github.com/alfatm/sqlx-dyn"
+readme = "../README.md"
+keywords = ["sqlx", "postgres", "query-builder", "proc-macro", "injection"]
+categories = ["database", "development-tools/procedural-macro"]
+
+[dependencies]
+sqlx.workspace = true
+sqlx_dyn_macros = { path = "../sqlx_dyn_macros", version = "0.1.1" }
+
+[features]
+# End-to-end tests against a real PostgreSQL in Docker. Off by default so
+# that `cargo test` needs no daemon; enable with `--features e2e`.
+e2e = []
+
+[dev-dependencies]
+trybuild = "1"
+sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio", "macros"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+testcontainers-modules = { version = "0.15.0", features = ["postgres"] }
+
+[[test]]
+name = "e2e"
+required-features = ["e2e"]

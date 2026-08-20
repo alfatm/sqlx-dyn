@@ -1,0 +1,69 @@
+error[E0277]: the trait bound `NotEncodable: sqlx_core::encode::Encode<'_, sqlx_dyn::__private::Postgres>` is not satisfied
+ --> tests/compile_fail/unbindable_type.rs:9:21
+  |
+9 |     let _q = query!("SELECT * FROM users WHERE id = ${x}");
+  |              -------^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^-
+  |              |      |
+  |              |      unsatisfied trait bound
+  |              required by a bound introduced by this call
+  |
+help: the trait `sqlx_core::encode::Encode<'_, sqlx_dyn::__private::Postgres>` is not implemented for `NotEncodable`
+ --> tests/compile_fail/unbindable_type.rs:5:1
+  |
+5 | struct NotEncodable;
+  | ^^^^^^^^^^^^^^^^^^^
+  = help: the following other types implement trait `sqlx_core::encode::Encode<'q, DB>`:
+            `&'q serde_json::raw::RawValue` implements `sqlx_core::encode::Encode<'q, DB>`
+            `&T` implements `sqlx_core::encode::Encode<'q, DB>`
+            `&[T]` implements `sqlx_core::encode::Encode<'q, sqlx_dyn::__private::Postgres>`
+            `&[u8]` implements `sqlx_core::encode::Encode<'_, sqlx_dyn::__private::Postgres>`
+            `&str` implements `sqlx_core::encode::Encode<'_, sqlx_dyn::__private::Postgres>`
+            `Arc<T>` implements `sqlx_core::encode::Encode<'q, DB>`
+            `Arc<[u8]>` implements `sqlx_core::encode::Encode<'q, sqlx_dyn::__private::Postgres>`
+            `Arc<str>` implements `sqlx_core::encode::Encode<'q, sqlx_dyn::__private::Postgres>`
+          and $N others
+note: required by a bound in `sqlx_dyn::__private::QueryBuilder::<DB>::push_bind`
+ --> $CARGO/sqlx-core-$VERSION/src/query_builder.rs
+  |
+  |     pub fn push_bind<'t, T>(&mut self, value: T) -> &mut Self
+  |            --------- required by a bound in this associated function
+  |     where
+  |         T: Encode<'t, DB> + Type<DB>,
+  |            ^^^^^^^^^^^^^^ required by this bound in `QueryBuilder::<DB>::push_bind`
+
+error[E0277]: the trait bound `NotEncodable: sqlx_core::types::Type<sqlx_dyn::__private::Postgres>` is not satisfied
+ --> tests/compile_fail/unbindable_type.rs:9:21
+  |
+9 |     let _q = query!("SELECT * FROM users WHERE id = ${x}");
+  |              -------^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^-
+  |              |      |
+  |              |      unsatisfied trait bound
+  |              required by a bound introduced by this call
+  |
+help: the trait `sqlx_core::types::Type<sqlx_dyn::__private::Postgres>` is not implemented for `NotEncodable`
+ --> tests/compile_fail/unbindable_type.rs:5:1
+  |
+5 | struct NotEncodable;
+  | ^^^^^^^^^^^^^^^^^^^
+  = help: the following other types implement trait `sqlx_core::types::Type<DB>`:
+            ()
+            (T1,)
+            (T1, T2)
+            (T1, T2, T3)
+            (T1, T2, T3, T4)
+            (T1, T2, T3, T4, T5)
+            (T1, T2, T3, T4, T5, T6)
+            (T1, T2, T3, T4, T5, T6, T7)
+          and $N others
+note: required by a bound in `sqlx_dyn::__private::QueryBuilder::<DB>::push_bind`
+ --> $CARGO/sqlx-core-$VERSION/src/query_builder.rs
+  |
+  |     pub fn push_bind<'t, T>(&mut self, value: T) -> &mut Self
+  |            --------- required by a bound in this associated function
+  |     where
+  |         T: Encode<'t, DB> + Type<DB>,
+  |                             ^^^^^^^^ required by this bound in `QueryBuilder::<DB>::push_bind`
+help: use a unary tuple instead
+  |
+9 |     let _q = query!(("SELECT * FROM users WHERE id = ${x}",));
+  |                     +                                     ++

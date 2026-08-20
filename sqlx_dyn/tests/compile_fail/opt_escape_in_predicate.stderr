@@ -1,0 +1,7 @@
+error: an `$${` or `##{` escape cannot appear inside the same predicate as `${?...}`.
+       The predicate must be removable as one piece, while an escape is unwrapped separately, so the two cannot overlap.
+       Move the escaped text out of this predicate or use a plain bind `${...}`.
+ --> tests/compile_fail/opt_escape_in_predicate.rs:9:12
+  |
+9 |     query!("SELECT * FROM t WHERE a = ${?x} || '$${z}' AND b = 1");
+  |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

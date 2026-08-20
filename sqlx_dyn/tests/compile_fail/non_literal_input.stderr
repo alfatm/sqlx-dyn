@@ -1,0 +1,5 @@
+error: expected string literal
+ --> tests/compile_fail/non_literal_input.rs:7:21
+  |
+7 |     let _q = query!(some_variable);
+  |                     ^^^^^^^^^^^^^

@@ -1,0 +1,15 @@
+error[E0277]: the trait bound `Box<str>: SqlFragmentLike` is not satisfied
+ --> tests/compile_fail/box_str_fragment.rs:6:14
+  |
+6 |     let _q = query!("SELECT * FROM users WHERE #{filter}");
+  |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `SqlFragmentLike` is not implemented for `Box<str>`
+  |
+help: the following other types implement trait `SqlFragmentLike`
+ --> src/fragment.rs
+  |
+  | impl SqlFragmentLike for SqlFragment {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `SqlFragment`
+...
+  | impl<T: SqlFragmentLike + ?Sized> SqlFragmentLike for &T {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `&T`
+  = note: this error originates in the macro `query` (in Nightly builds, run with -Z macro-backtrace for more info)

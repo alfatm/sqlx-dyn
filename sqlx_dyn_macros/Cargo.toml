@@ -1,0 +1,18 @@
+[package]
+name = "sqlx_dyn_macros"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Proc-macro implementation of the sqlx_dyn crate"
+repository = "https://github.com/alfatm/sqlx-dyn"
+readme = "../README.md"
+keywords = ["sqlx", "postgres", "query-builder", "proc-macro"]
+categories = ["development-tools/procedural-macro"]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn.workspace = true
+quote.workspace = true
+proc-macro2.workspace = true

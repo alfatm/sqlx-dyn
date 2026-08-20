@@ -1,0 +1,6 @@
+error: invalid Rust expression inside `${...}`: `foo +`
+         unexpected end of input, expected an expression
+ --> tests/compile_fail/invalid_bind_expr.rs:6:21
+  |
+6 |     let _q = query!("SELECT * FROM users WHERE id = ${foo +}");
+  |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

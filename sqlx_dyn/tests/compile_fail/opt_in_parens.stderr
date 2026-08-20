@@ -1,0 +1,6 @@
+error: `${?...}` must be a whole top-level predicate, but `(` appears between `WHERE` and the marker.
+       Removing the predicate would leave unbalanced SQL. Move the optional condition into its own `AND` clause or use a plain bind `${...}`.
+ --> tests/compile_fail/opt_in_parens.rs:7:12
+  |
+7 |     query!("SELECT * FROM t WHERE (a = ${?x} OR b = 1)");
+  |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

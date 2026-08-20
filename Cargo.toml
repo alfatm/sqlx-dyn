@@ -1,0 +1,14 @@
+[workspace]
+members = ["sqlx_dyn", "sqlx_dyn_macros"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.1"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+sqlx = { version = "0.9", default-features = false, features = ["postgres"] }
+syn = { version = "3", features = ["full", "parsing", "printing", "proc-macro"] }
+quote = "1"
+proc-macro2 = "1"

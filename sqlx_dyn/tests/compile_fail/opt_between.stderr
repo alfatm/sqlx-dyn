@@ -1,0 +1,8 @@
+error: `${?...}` must follow a comparison operator, but follows `BETWEEN`.
+       Supported: = <> != < > <= >= LIKE ILIKE
+       Only predicates of the form `col = ${?x}` are unambiguously removable: `BETWEEN ${?lo} AND ${?hi}` would leave `WHERE age BETWEEN $1`, and `LIMIT`/`OFFSET`/`ORDER BY` are not predicates at all.
+       Make the value unconditional via `COALESCE(${x}, <default>)`, use a plain bind `${...}`, or give the condition its own `AND` clause.
+ --> tests/compile_fail/opt_between.rs:8:12
+  |
+8 |     query!("SELECT * FROM t WHERE age BETWEEN ${?lo} AND ${?hi}");
+  |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

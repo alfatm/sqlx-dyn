@@ -1,0 +1,20 @@
+error[E0277]: the trait bound `Evil: SqlFragmentLike` is not satisfied
+  --> tests/compile_fail/display_fragment.rs:15:14
+   |
+15 |     let _q = query!("SELECT * FROM users WHERE #{Evil}");
+   |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `SqlFragmentLike` is not implemented for `Evil`
+  --> tests/compile_fail/display_fragment.rs:7:1
+   |
+ 7 | struct Evil;
+   | ^^^^^^^^^^^
+help: the following other types implement trait `SqlFragmentLike`
+  --> src/fragment.rs
+   |
+   | impl SqlFragmentLike for SqlFragment {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `SqlFragment`
+...
+   | impl<T: SqlFragmentLike + ?Sized> SqlFragmentLike for &T {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `&T`
+   = note: this error originates in the macro `query` (in Nightly builds, run with -Z macro-backtrace for more info)

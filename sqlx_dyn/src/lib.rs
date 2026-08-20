@@ -259,10 +259,28 @@
 //! does a quote inside a comment — `/* it's */` is a comment containing an
 //! apostrophe, not a comment plus an open literal.
 //!
+//! Where a literal *ends* follows PostgreSQL's default
+//! `standard_conforming_strings = on`: a backslash before the closing quote is
+//! ordinary data in `'a\'` and `"a\"`, so the literal ends there, but an escape
+//! in `E'a\'`, so it continues. `s = 'a\' -- c` is therefore a literal followed
+//! by a real comment (stripped), while `s = E'a\' -- c'` is one string whose body
+//! contains `--` (left alone). `standard_conforming_strings = off` is not
+//! supported.
+//!
+//! The `E` counts only as a standalone prefix: `code'a\'` is a *type-prefixed*
+//! literal, which does not escape, so it ends at the quote. `U&'...'` is an
+//! ordinary literal here too — its backslash introduces a codepoint (`\0041`),
+//! never a quote escape, and PostgreSQL rejects a trailing `U&'a\'` outright.
+//!
 //! An *unterminated* `/*` is rejected instead: there is no end to strip up to,
-//! so it would swallow whatever follows the marker. So is a fragment that
-//! contributes nothing but a comment: it would splice an empty string, leaving
-//! `WHERE #{F}` as a bare `WHERE` that PostgreSQL blames on the template.
+//! so it would swallow whatever follows the marker. So is an unclosed `'`, `"`
+//! or `$tag$`, for the same reason one step out: the literal does not stop at
+//! the fragment's edge, so it consumes the template after the marker. PostgreSQL
+//! rejects that statement rather than silently matching other rows, but which
+//! template the fragment lands in decides whether it does — so it fails where it
+//! is written. So is a fragment that contributes nothing but a comment: it would
+//! splice an empty string, leaving `WHERE #{F}` as a bare `WHERE` that
+//! PostgreSQL blames on the template.
 //!
 //! For the same reason [`sql_fragment!`] rejects a fragment that *starts* with
 //! `AND`/`OR`. The joiner describes how the fragment is combined, not what it
@@ -306,6 +324,14 @@
 //! let q = query!("SELECT '$${not_a_bind}', '##{not_a_fragment}', $$1");
 //! assert_eq!(q.sql(), "SELECT '${not_a_bind}', '#{not_a_fragment}', $$1");
 //! ```
+//!
+//! Escaping is needed there because interpolation is a text layer *above* SQL:
+//! markers are found by position in the template, before anything is read as
+//! SQL. A `${...}` inside a string literal or a SQL comment still interpolates —
+//! which is why the example above escapes both. The lexical rules described
+//! under [optional predicates](#optional-predicates) govern where a *literal*
+//! ends and what a comment covers; they never decide whether a marker is a
+//! marker.
 //!
 //! # Scope
 //!

@@ -214,7 +214,10 @@ fn like_and_lte_and_lt_operators() {
     let b = Some(1i32);
     let c = Some(2i32);
     let q = query!("SELECT * FROM t WHERE a LIKE ${?a} AND b <= ${?b} AND c < ${?c}");
-    assert_eq!(q.sql(), "SELECT * FROM t WHERE a LIKE $1 AND b <= $2 AND c < $3");
+    assert_eq!(
+        q.sql(),
+        "SELECT * FROM t WHERE a LIKE $1 AND b <= $2 AND c < $3"
+    );
 }
 
 #[test]
@@ -350,9 +353,10 @@ fn no_whitespace_debris_in_single_line_templates() {
     for a in [Some(1i32), None] {
         for b in [Some(2i32), None] {
             for c in [Some(3i32), None] {
-                let sql =
-                    query!("SELECT * FROM t WHERE a = ${?a} AND b = ${?b} OR c = ${?c} ORDER BY id")
-                        .sql();
+                let sql = query!(
+                    "SELECT * FROM t WHERE a = ${?a} AND b = ${?b} OR c = ${?c} ORDER BY id"
+                )
+                .sql();
                 assert!(!sql.contains("  "), "double space in {sql:?}");
                 assert_eq!(sql, sql.trim(), "stray outer whitespace in {sql:?}");
             }
@@ -719,10 +723,8 @@ fn an_unclaimed_where_does_not_produce_a_second_where_after_union() {
     let x: Option<i64> = None;
     let y: Option<i64> = Some(2);
     assert_eq!(
-        query!(
-            "SELECT * FROM t WHERE a = ${?x} UNION SELECT * FROM u WHERE b = 1 AND c = ${?y}"
-        )
-        .sql(),
+        query!("SELECT * FROM t WHERE a = ${?x} UNION SELECT * FROM u WHERE b = 1 AND c = ${?y}")
+            .sql(),
         "SELECT * FROM t UNION SELECT * FROM u WHERE b = 1 AND c = $1"
     );
 }
@@ -1406,8 +1408,7 @@ fn a_cte_body_can_itself_be_the_fragment() {
 #[test]
 fn a_subquery_body_fragment_keeps_the_outer_predicates_intact() {
     // Same shape, one level down: the fragment is an `IN (...)` body.
-    const IDS: SqlFragment =
-        sql_fragment!("SELECT id FROM u WHERE active UNION SELECT id FROM v");
+    const IDS: SqlFragment = sql_fragment!("SELECT id FROM u WHERE active UNION SELECT id FROM v");
     let a: Option<i32> = None;
     let b = Some(2i32);
     assert_eq!(
@@ -1436,8 +1437,7 @@ fn a_fragment_opening_a_top_level_clause_breaks_the_joiner() {
     // written `AND`. The second select needs its own `WHERE`.
     // A plausible mistake: the fragment carries a predicate *and* the query's
     // shape, instead of just the predicate.
-    const BAD: SqlFragment =
-        SqlFragment::new("deleted_at IS NULL UNION SELECT x FROM u");
+    const BAD: SqlFragment = SqlFragment::new("deleted_at IS NULL UNION SELECT x FROM u");
     let p: Option<i32> = None;
     let q = Some(2i32);
     assert_eq!(
@@ -1481,8 +1481,7 @@ fn the_same_boundary_in_the_template_is_handled_correctly() {
 fn a_fragment_boundary_is_harmless_without_optional_predicates() {
     // Nothing to bookkeep: with no `${?...}` in the template, every push is
     // unconditional and the fragment's own structure is the author's business.
-    const BAD: SqlFragment =
-        SqlFragment::new("deleted_at IS NULL UNION SELECT x FROM u");
+    const BAD: SqlFragment = SqlFragment::new("deleted_at IS NULL UNION SELECT x FROM u");
     assert_eq!(
         query!("SELECT x FROM t WHERE #{BAD}").sql(),
         "SELECT x FROM t WHERE deleted_at IS NULL UNION SELECT x FROM u"
@@ -1554,7 +1553,10 @@ fn a_rust_comment_inside_an_interpolation_is_skipped() {
     let a = 1i32;
     assert_eq!(query!("SELECT ${/* } */ a}").sql(), "SELECT $1");
     assert_eq!(query!("SELECT ${a /* } */}").sql(), "SELECT $1");
-    assert_eq!(query!("SELECT ${/* nested /* } */ */ a}").sql(), "SELECT $1");
+    assert_eq!(
+        query!("SELECT ${/* nested /* } */ */ a}").sql(),
+        "SELECT $1"
+    );
     assert_eq!(query!("SELECT ${\n// }\na}").sql(), "SELECT $1");
 }
 
@@ -1609,6 +1611,79 @@ fn a_quote_inside_a_fragments_comment_does_not_open_a_literal() {
     assert_eq!(
         query!("SELECT * FROM t WHERE a = ${?x} AND #{APOSTROPHE}").sql(),
         "SELECT * FROM t WHERE c = 1            AND d = 2"
+    );
+}
+
+#[test]
+fn a_backslash_before_a_closing_quote_does_not_hide_sql() {
+    // Verified against PostgreSQL 16 (`standard_conforming_strings = on`):
+    // `select 'a\'` yields `a\`, so the literal is complete and the `--` after it
+    // is a real comment. Treating `\'` as an escape hid the comment from the
+    // fragment check, and `AND b = 1` reached the database commented out.
+    const HIDDEN: SqlFragment = sql_fragment!(r"s = 'a\' -- c");
+    let x = Some(1i32);
+    assert_eq!(
+        query!("SELECT * FROM t WHERE a = ${?x} AND #{HIDDEN} AND b = 1").sql(),
+        r"SELECT * FROM t WHERE a = $1 AND s = 'a\'      AND b = 1"
+    );
+    // A quoted identifier never escapes with a backslash at all.
+    const IDENT: SqlFragment = sql_fragment!(r#"s = "a\" -- c"#);
+    assert_eq!(
+        query!("SELECT * FROM t WHERE a = ${?x} AND #{IDENT} AND b = 1").sql(),
+        r#"SELECT * FROM t WHERE a = $1 AND s = "a\"      AND b = 1"#
+    );
+}
+
+#[test]
+fn a_non_ascii_byte_before_e_does_not_open_an_extended_string() {
+    // `E` escapes only as a standalone prefix, and whether `éE` names a type
+    // cannot be decided here. Reading the `E` as a prefix is the direction that
+    // hides SQL — the literal would run past its quote and take the comment with
+    // it — so the fragment is lexed as an ordinary literal.
+    const F: SqlFragment = sql_fragment!(r"s = éE'a\' -- c");
+    let x = Some(1i32);
+    assert_eq!(
+        query!("SELECT * FROM t WHERE a = ${?x} AND #{F} AND b = 1").sql(),
+        r"SELECT * FROM t WHERE a = $1 AND s = éE'a\'      AND b = 1"
+    );
+}
+
+#[test]
+fn a_unicode_escape_literal_is_lexed_as_an_ordinary_literal() {
+    // `U&'...'` uses `\` for codepoints (`\0041`), never to escape a quote:
+    // PostgreSQL rejects `U&'a\'` outright ("invalid Unicode escape"). So the
+    // literal ends at the quote here too, and the comment after it is stripped.
+    const F: SqlFragment = sql_fragment!(r"s = U&'a\0041' -- c");
+    let x = Some(1i32);
+    assert_eq!(
+        query!("SELECT * FROM t WHERE a = ${?x} AND #{F} AND b = 1").sql(),
+        r"SELECT * FROM t WHERE a = $1 AND s = U&'a\0041'      AND b = 1"
+    );
+}
+
+#[test]
+fn a_literal_closing_on_the_last_byte_is_accepted() {
+    // The unclosed-literal check must not read "the literal ran to the end of
+    // the fragment" as "the literal never closed".
+    const TAIL: SqlFragment = sql_fragment!("s = 'a'");
+    const DOUBLED: SqlFragment = sql_fragment!("s = 'it''s'");
+    const DOLLAR: SqlFragment = sql_fragment!("s = $q$a$q$");
+    let x = Some(1i32);
+    assert_eq!(
+        query!("SELECT * FROM t WHERE a = ${?x} AND #{TAIL} AND #{DOUBLED} AND #{DOLLAR}").sql(),
+        "SELECT * FROM t WHERE a = $1 AND s = 'a' AND s = 'it''s' AND s = $q$a$q$"
+    );
+}
+
+#[test]
+fn an_extended_string_still_escapes_its_quotes() {
+    // `select E'a\' -- c'` yields `a' -- c`: the `--` is data, so the literal
+    // must not be cut short and the comment must not be stripped.
+    const KEPT: SqlFragment = sql_fragment!(r"s = E'a\' -- c' AND d = 2");
+    let x = Some(1i32);
+    assert_eq!(
+        query!("SELECT * FROM t WHERE a = ${?x} AND #{KEPT}").sql(),
+        r"SELECT * FROM t WHERE a = $1 AND s = E'a\' -- c' AND d = 2"
     );
 }
 

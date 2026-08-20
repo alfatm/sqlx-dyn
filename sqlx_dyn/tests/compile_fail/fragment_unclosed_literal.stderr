@@ -1,0 +1,15 @@
+error: this SQL fragment leaves a quoted literal unclosed.
+       A fragment is spliced verbatim, so the literal does not end at the fragment's edge: it runs on into the template and swallows the SQL after the marker. PostgreSQL then rejects the whole statement, and which template the fragment is used in decides whether it does.
+       Close the quote, or double it (`''`, `""`) if it is data.
+ --> tests/compile_fail/fragment_unclosed_literal.rs:8:32
+  |
+8 |     let _quote = sql_fragment!("s = 'a");
+  |                                ^^^^^^^^
+
+error: this SQL fragment leaves a quoted literal unclosed.
+       A fragment is spliced verbatim, so the literal does not end at the fragment's edge: it runs on into the template and swallows the SQL after the marker. PostgreSQL then rejects the whole statement, and which template the fragment is used in decides whether it does.
+       Close the quote, or double it (`''`, `""`) if it is data.
+ --> tests/compile_fail/fragment_unclosed_literal.rs:9:33
+  |
+9 |     let _dollar = sql_fragment!("s = $q$a");
+  |                                 ^^^^^^^^^^

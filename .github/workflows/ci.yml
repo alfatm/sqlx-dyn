@@ -19,6 +19,10 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
 
+      # `cargo fmt --all --check` is not gated here yet: it currently fails on
+      # files predating this workflow (examples/, tests/e2e.rs and others).
+      # Reformatting them is a separate change from the logic fixes this
+      # workflow was added for.
       - run: cargo clippy --workspace --all-targets
 
       # trybuild compares against committed .stderr files, which are sensitive

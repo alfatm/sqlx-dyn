@@ -156,8 +156,7 @@ pub fn parse_template(input: &str, span: Span) -> Result<Vec<Part>, ParseError> 
                                 "empty optional interpolation `${?}`".to_string(),
                             ));
                         }
-                        let mut predicate =
-                            split_predicate(&text, inner.to_string(), span)?;
+                        let mut predicate = split_predicate(&text, inner.to_string(), span)?;
                         // `split_predicate` cut the predicate's own SQL out of
                         // the accumulated text; whatever remains is mandatory.
                         text.truncate(predicate.text_len);
@@ -233,7 +232,10 @@ pub fn parse_template(input: &str, span: Span) -> Result<Vec<Part>, ParseError> 
     // `${..}` is not mistaken for SQL.
     // `stripped` is `Some` exactly when a `${?..}` marker was found, so this is
     // the whole-template comment check.
-    if stripped.as_deref().is_some_and(|s| find_comment(s).is_some()) {
+    if stripped
+        .as_deref()
+        .is_some_and(|s| find_comment(s).is_some())
+    {
         return Err(ParseError::new(
             "SQL comments are not supported in a template using `${?..}`.\n\
              A comment after the marker hides the keyword that follows it: the \
@@ -254,8 +256,7 @@ pub fn parse_template(input: &str, span: Span) -> Result<Vec<Part>, ParseError> 
 /// select, and `HAVING` is a separate list from the `WHERE` above it. Without
 /// per-clause state, one clause's `WHERE` could introduce a predicate in
 /// another, or a clause's own `WHERE` would be replaced by a dangling `AND`.
-const CLAUSE_BOUNDARIES: [&str; 6] =
-    ["WHERE", "HAVING", "UNION", "INTERSECT", "EXCEPT", "QUALIFY"];
+const CLAUSE_BOUNDARIES: [&str; 6] = ["WHERE", "HAVING", "UNION", "INTERSECT", "EXCEPT", "QUALIFY"];
 
 /// One lexical pass over a fragment, producing every view the fragment checks
 /// need.
@@ -271,7 +272,7 @@ const CLAUSE_BOUNDARIES: [&str; 6] =
 ///
 /// Offsets are preserved byte for byte in both views, so an index found in one
 /// indexes the source and the other.
-struct FragmentLex {
+pub struct FragmentLex {
     /// The source with comment bytes blanked to spaces and everything else —
     /// literals included — left exactly as written. This is the text the
     /// fragment contributes to the query.
@@ -284,12 +285,15 @@ struct FragmentLex {
     structure: String,
     /// Whether a `/*` is left unclosed at the end of the fragment.
     unterminated_block: bool,
+    /// Whether a `'`, `"` or `$tag$` is left unclosed at the end of the
+    /// fragment.
+    unterminated_literal: bool,
     /// Whether any comment was found at all.
     has_comment: bool,
 }
 
 impl FragmentLex {
-    fn scan(sql: &str) -> Self {
+    pub fn scan(sql: &str) -> Self {
         let bytes = sql.as_bytes();
         let mut blanked = bytes.to_vec();
         // Structure starts fully blank and is filled in only for bytes the scan
@@ -297,6 +301,7 @@ impl FragmentLex {
         let mut structure = vec![b' '; bytes.len()];
         let mut has_comment = false;
         let mut unterminated_block = false;
+        let mut unterminated_literal = false;
         let mut i = 0;
 
         while i < bytes.len() {
@@ -346,39 +351,35 @@ impl FragmentLex {
             // text, so brackets, quotes and comment markers inside it are data.
             if bytes[i] == b'$' {
                 if let Some(tag) = dollar_tag(bytes, i) {
-                    i = find_subslice(bytes, i + tag, &bytes[i..i + tag])
-                        .map_or(bytes.len(), |at| at + tag);
+                    match find_subslice(bytes, i + tag, &bytes[i..i + tag]) {
+                        Some(at) => i = at + tag,
+                        None => {
+                            unterminated_literal = true;
+                            i = bytes.len();
+                        }
+                    }
                     continue;
                 }
                 structure[i] = b'$';
                 i += 1;
                 continue;
             }
-            // `'...'` / `"..."`. A doubled quote is an escaped quote; a
-            // backslash escapes the next character in `E'...'` strings and under
-            // `standard_conforming_strings = off`. Treating `\'` as one unit
-            // keeps `E'a\'b'` intact at the cost of running past the closing
-            // quote of `'a\'`, which is complete under the default setting. Here
-            // that costs a false *rejection* — a compile error on working SQL —
-            // which is the safe direction.
+            // `'...'` / `"..."`. Its body is data, so a comment marker or
+            // bracket inside it is not structure. Where the literal *ends* is
+            // decided by [`quoted_end`], which is also what keeps `'a\'` from
+            // swallowing the SQL after it.
             if bytes[i] == b'\'' || bytes[i] == b'"' {
-                let q = bytes[i];
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b'\\' {
-                        i += 2;
-                        continue;
-                    }
-                    if bytes[i] == q {
-                        if bytes.get(i + 1) == Some(&q) {
-                            i += 2;
-                            continue;
-                        }
-                        i += 1;
-                        break;
-                    }
-                    i += 1;
+                // An `E`/`e` prefix is part of the literal, not a keyword, so it
+                // is blanked with it rather than left in `structure`.
+                if opens_extended_string(bytes, i) {
+                    structure[i - 1] = b' ';
                 }
+                // An unclosed literal consumes the rest of the fragment: text
+                // that never closes cannot be read as structure.
+                i = quoted_end(bytes, i).unwrap_or_else(|| {
+                    unterminated_literal = true;
+                    bytes.len()
+                });
                 continue;
             }
             if bytes[i].is_ascii() {
@@ -394,143 +395,193 @@ impl FragmentLex {
                 .expect("only ASCII spaces were written over comment bytes"),
             structure: String::from_utf8(structure).expect("structure is ASCII by construction"),
             unterminated_block,
+            unterminated_literal,
             has_comment,
         }
     }
-}
 
-/// Blanks a fragment's SQL comments, or `None` when it has none.
-///
-/// A template using `${?...}` may not contain a comment, because one can hide
-/// the joiner between two predicates and silently change which rows match. A
-/// fragment is opaque to that whole-template check, so a comment smuggled inside
-/// one reopens exactly the hole:
-///
-/// ```text
-/// const F: SqlFragment = sql_fragment!("c = 1 --");
-/// query!("SELECT * FROM t WHERE a = ${?x} AND #{F} AND b = 1")
-/// -> SELECT * FROM t WHERE a = $1 AND c = 1 -- AND b = 1
-/// ```
-///
-/// `AND b = 1` is commented out and the query matches more rows than written.
-/// PostgreSQL accepts it, so nothing fails loudly.
-///
-/// A comment is a *comment about the fragment*, not SQL the fragment
-/// contributes, so it is blanked rather than rejected: the fragment keeps
-/// working and the hazard is gone. Only the comment is touched — a `--` or `/*`
-/// inside a string literal or a dollar-quoted body is data and survives, and a
-/// quote *inside* a comment is comment text, not a literal. See [`FragmentLex`].
-///
-/// Whitespace is not trimmed: a fragment is spliced verbatim, so its leading and
-/// trailing spaces are the separators between it and the template around it.
-/// Blanking a comment must not also delete them — that is what would turn
-/// `WHERE#{F}` into `WHEREa = 1`. An unclosed `/*` is a separate matter — see
-/// [`fragment_comment_unterminated`].
-pub fn fragment_comments_blanked(sql: &str) -> Option<String> {
-    let lex = FragmentLex::scan(sql);
-    lex.has_comment.then_some(lex.comments_blanked)
-}
-
-/// Whether a fragment is empty, or contributes nothing but whitespace.
-///
-/// A fragment holding only a comment blanks away to nothing. Emitting it would
-/// splice an empty string where SQL was expected, so `WHERE #{NOTE}` becomes a
-/// bare `WHERE` — a syntax error at runtime, pointing at the template rather
-/// than at the fragment that caused it. Rejecting it names the real problem.
-///
-/// Runs on the comment-blanked text, so this is what the fragment would actually
-/// contribute, not what was written.
-pub fn fragment_is_empty(sql: &str) -> bool {
-    FragmentLex::scan(sql).comments_blanked.trim().is_empty()
-}
-
-/// Whether a fragment leaves a block comment unterminated.
-///
-/// An unclosed `/*` cannot be blanked away: it would comment out the template
-/// text that follows the marker, and there is no end for the blanking to stop
-/// at. `--` needs no such rule — a line comment is closed by the end of the
-/// fragment, and blanking it removes it entirely.
-///
-/// A `/*` inside a literal is data, and a `/*` inside another block comment
-/// nests, so both are resolved by the single scan in [`FragmentLex`].
-pub fn fragment_comment_unterminated(sql: &str) -> bool {
-    FragmentLex::scan(sql).unterminated_block
-}
-
-/// Whether a fragment starts with `AND`/`OR`, which the template must own.
-///
-/// A fragment marker is opaque, so codegen cannot lift a joiner out of it the
-/// way [`lift_joiners_after_optionals`] does for literal text. When the optional
-/// predicate before such a fragment drops, its `WHERE` goes with it and the
-/// fragment's own `AND` is left dangling:
-///
-/// ```text
-/// query!("SELECT * FROM t WHERE a = ${?x} #{AND_B}")   // x = None
-/// -> SELECT * FROM t AND b = 1
-/// ```
-///
-/// Writing the joiner in the template instead — `WHERE a = ${?x} AND #{B}` —
-/// puts it where the scanner can see it, and the `WHERE` is handed over
-/// correctly. Nothing is lost: the joiner belongs to how the fragment is
-/// *combined*, not to the fragment.
-///
-/// Matched on the [`FragmentLex`] structure view, so a leading comment does not
-/// hide the keyword and a leading literal cannot fake one.
-pub fn fragment_starts_with_joiner(sql: &str) -> Option<&'static str> {
-    let view = FragmentLex::scan(sql).structure;
-    let head = view.trim_start();
-    ["AND", "OR"].into_iter().find(|kw| {
-        head.strip_prefix(*kw).is_some_and(|rest| {
-            // A word boundary is required, or a column named `android` would
-            // look like a leading `AND`.
-            rest.is_empty()
-                || !(rest.as_bytes()[0].is_ascii_alphanumeric() || rest.as_bytes()[0] == b'_')
-        })
-    })
-}
-
-/// Whether a fragment's brackets fail to balance within it.
-///
-/// A fragment is spliced verbatim into the template, so an unmatched `(` or `)`
-/// does not just break the fragment's own SQL — it reaches into the template's
-/// nesting, where a `)` can close a construct the fragment never opened and the
-/// clause map is built on brackets the final SQL does not have. `a = 1) AND (b =
-/// 2` is the shape: bracket counts balance, yet the first `)` closes the
-/// template's.
-///
-/// Clause keywords are deliberately *not* rejected: a fragment *may* contain
-/// `UNION`, `HAVING` and friends, because how deep the fragment lands is a
-/// property of the template, not of the fragment, so the two cannot be judged
-/// apart. A body like `SELECT .. UNION ALL SELECT ..` is exactly what belongs in
-/// `WITH t AS (#{body})`. The cost is documented instead — see the "fragments
-/// and optional predicates" section of the crate docs — and it produces SQL
-/// Postgres rejects, not SQL that silently means something else.
-///
-/// Brackets are matched on the [`FragmentLex`] structure view, so a bracket
-/// inside a string literal, a dollar-quoted body or a SQL comment is data and
-/// does not count.
-///
-/// Returns `true` when the fragment must be rejected.
-pub fn fragment_brackets_unbalanced(sql: &str) -> bool {
-    let bytes = FragmentLex::scan(sql).structure.into_bytes();
-    let mut depth = 0i32;
-
-    for b in bytes {
-        match b {
-            b'(' => depth += 1,
-            b')' => {
-                depth -= 1;
-                // Negative means this `)` closes a bracket belonging to the
-                // template. Checking only the final balance would pass
-                // `a = 1) AND (b = 2`.
-                if depth < 0 {
-                    return true;
-                }
-            }
-            _ => {}
-        }
+    /// Blanks a fragment's SQL comments, or `None` when it has none.
+    ///
+    /// A template using `${?...}` may not contain a comment, because one can hide
+    /// the joiner between two predicates and silently change which rows match. A
+    /// fragment is opaque to that whole-template check, so a comment smuggled inside
+    /// one reopens exactly the hole:
+    ///
+    /// ```text
+    /// const F: SqlFragment = sql_fragment!("c = 1 --");
+    /// query!("SELECT * FROM t WHERE a = ${?x} AND #{F} AND b = 1")
+    /// -> SELECT * FROM t WHERE a = $1 AND c = 1 -- AND b = 1
+    /// ```
+    ///
+    /// `AND b = 1` is commented out and the query matches more rows than written.
+    /// PostgreSQL accepts it, so nothing fails loudly.
+    ///
+    /// A comment is a *comment about the fragment*, not SQL the fragment
+    /// contributes, so it is blanked rather than rejected: the fragment keeps
+    /// working and the hazard is gone. Only the comment is touched — a `--` or `/*`
+    /// inside a string literal or a dollar-quoted body is data and survives, and a
+    /// quote *inside* a comment is comment text, not a literal. See [`FragmentLex`].
+    ///
+    /// Whitespace is not trimmed: a fragment is spliced verbatim, so its leading and
+    /// trailing spaces are the separators between it and the template around it.
+    /// Blanking a comment must not also delete them — that is what would turn
+    /// `WHERE#{F}` into `WHEREa = 1`. An unclosed `/*` is a separate matter — see
+    /// [`fragment_comment_unterminated`].
+    pub fn comments_blanked(&self) -> Option<&str> {
+        self.has_comment.then_some(self.comments_blanked.as_str())
     }
-    depth != 0
+
+    /// Whether a fragment is empty, or contributes nothing but whitespace.
+    ///
+    /// A fragment holding only a comment blanks away to nothing. Emitting it would
+    /// splice an empty string where SQL was expected, so `WHERE #{NOTE}` becomes a
+    /// bare `WHERE` — a syntax error at runtime, pointing at the template rather
+    /// than at the fragment that caused it. Rejecting it names the real problem.
+    ///
+    /// Runs on the comment-blanked text, so this is what the fragment would actually
+    /// contribute, not what was written.
+    pub fn is_empty(&self) -> bool {
+        self.comments_blanked.trim().is_empty()
+    }
+
+    /// Whether a fragment leaves a block comment unterminated.
+    ///
+    /// An unclosed `/*` cannot be blanked away: it would comment out the template
+    /// text that follows the marker, and there is no end for the blanking to stop
+    /// at. `--` needs no such rule — a line comment is closed by the end of the
+    /// fragment, and blanking it removes it entirely.
+    ///
+    /// A `/*` inside a literal is data, and a `/*` inside another block comment
+    /// nests, so both are resolved by the single scan in [`FragmentLex`].
+    pub fn comment_unterminated(&self) -> bool {
+        self.unterminated_block
+    }
+
+    /// Whether a fragment leaves a `'`, `"` or `$tag$` unclosed.
+    ///
+    /// The literal runs off the end of the fragment and into the template, where
+    /// it swallows SQL the fragment never wrote — the same over-extension the
+    /// backslash rule exists to prevent, only reaching past the marker instead
+    /// of past the quote. Unlike an unclosed `/*` this cannot silently change
+    /// which rows match; PostgreSQL rejects the statement. It is still rejected
+    /// here, because a fragment is validated so that it is safe to splice
+    /// anywhere, and this one is not: whether it parses depends on the template
+    /// that happens to follow it.
+    ///
+    /// A quote inside a comment or a `$tag$` body is not a delimiter, so this
+    /// reads the same single scan as every other check.
+    pub fn literal_unterminated(&self) -> bool {
+        self.unterminated_literal
+    }
+
+    /// Whether a fragment starts with `AND`/`OR`, which the template must own.
+    ///
+    /// A fragment marker is opaque, so codegen cannot lift a joiner out of it the
+    /// way [`lift_joiners_after_optionals`] does for literal text. When the optional
+    /// predicate before such a fragment drops, its `WHERE` goes with it and the
+    /// fragment's own `AND` is left dangling:
+    ///
+    /// ```text
+    /// query!("SELECT * FROM t WHERE a = ${?x} #{AND_B}")   // x = None
+    /// -> SELECT * FROM t AND b = 1
+    /// ```
+    ///
+    /// Writing the joiner in the template instead — `WHERE a = ${?x} AND #{B}` —
+    /// puts it where the scanner can see it, and the `WHERE` is handed over
+    /// correctly. Nothing is lost: the joiner belongs to how the fragment is
+    /// *combined*, not to the fragment.
+    ///
+    /// Matched on the [`FragmentLex`] structure view, so a leading comment does not
+    /// hide the keyword and a leading literal cannot fake one.
+    pub fn starts_with_joiner(&self) -> Option<&'static str> {
+        let head = self.structure.trim_start();
+        ["AND", "OR"].into_iter().find(|kw| {
+            head.strip_prefix(*kw).is_some_and(|rest| {
+                // A word boundary is required, or a column named `android` would
+                // look like a leading `AND`.
+                rest.is_empty()
+                    || !(rest.as_bytes()[0].is_ascii_alphanumeric() || rest.as_bytes()[0] == b'_')
+            })
+        })
+    }
+
+    /// Whether a fragment's brackets fail to balance within it.
+    ///
+    /// A fragment is spliced verbatim into the template, so an unmatched `(` or `)`
+    /// does not just break the fragment's own SQL — it reaches into the template's
+    /// nesting, where a `)` can close a construct the fragment never opened and the
+    /// clause map is built on brackets the final SQL does not have. `a = 1) AND (b =
+    /// 2` is the shape: bracket counts balance, yet the first `)` closes the
+    /// template's.
+    ///
+    /// Clause keywords are deliberately *not* rejected: a fragment *may* contain
+    /// `UNION`, `HAVING` and friends, because how deep the fragment lands is a
+    /// property of the template, not of the fragment, so the two cannot be judged
+    /// apart. A body like `SELECT .. UNION ALL SELECT ..` is exactly what belongs in
+    /// `WITH t AS (#{body})`. The cost is documented instead — see the "fragments
+    /// and optional predicates" section of the crate docs — and it produces SQL
+    /// Postgres rejects, not SQL that silently means something else.
+    ///
+    /// Brackets are matched on the [`FragmentLex`] structure view, so a bracket
+    /// inside a string literal, a dollar-quoted body or a SQL comment is data and
+    /// does not count.
+    ///
+    /// Returns `true` when the fragment must be rejected.
+    pub fn brackets_unbalanced(&self) -> bool {
+        let bytes = self.structure.as_bytes();
+        let mut depth = 0i32;
+
+        for &b in bytes {
+            match b {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    // Negative means this `)` closes a bracket belonging to the
+                    // template. Checking only the final balance would pass
+                    // `a = 1) AND (b = 2`.
+                    if depth < 0 {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        depth != 0
+    }
+}
+
+/// Convenience wrappers over [`FragmentLex`], one scan each.
+///
+/// `sql_fragment!` scans once and calls the methods; these exist for tests and
+/// for callers checking a single property, where the extra scan costs nothing
+/// and reads better than threading the lexer through.
+#[cfg(test)]
+mod one_shot {
+    use super::FragmentLex;
+
+    pub fn fragment_comments_blanked(sql: &str) -> Option<String> {
+        FragmentLex::scan(sql).comments_blanked().map(str::to_owned)
+    }
+
+    pub fn fragment_is_empty(sql: &str) -> bool {
+        FragmentLex::scan(sql).is_empty()
+    }
+
+    pub fn fragment_comment_unterminated(sql: &str) -> bool {
+        FragmentLex::scan(sql).comment_unterminated()
+    }
+
+    pub fn fragment_literal_unterminated(sql: &str) -> bool {
+        FragmentLex::scan(sql).literal_unterminated()
+    }
+
+    pub fn fragment_starts_with_joiner(sql: &str) -> Option<&'static str> {
+        FragmentLex::scan(sql).starts_with_joiner()
+    }
+
+    pub fn fragment_brackets_unbalanced(sql: &str) -> bool {
+        FragmentLex::scan(sql).brackets_unbalanced()
+    }
 }
 
 /// Assigns a clause index to every byte offset of the template.
@@ -639,38 +690,19 @@ fn strip_literals(sql: &str) -> String {
                     i += 1;
                 }
             },
-            // `'...'` / `"..."`, where a doubled quote is an escaped quote and —
-            // in Postgres `E'...'` strings and under
-            // `standard_conforming_strings = off` — a backslash escapes the next
-            // character.
-            //
-            // This is the opposite choice from [`find_comment`], on purpose, and
-            // the two are not reconcilable: treating `\'` as one unit keeps an
-            // `E'a\'b'` literal intact but makes `'a\'` — a complete literal
-            // under the default `standard_conforming_strings = on` — run past its
-            // closing quote. Here that costs a false *rejection* (the template
-            // fails to compile), which is the safe direction; in `find_comment`
-            // the same choice would cost a false *negative* (a real comment
-            // swallowed), which is not. Known limitation: a literal ending in a
-            // backslash right before its closing quote may be rejected.
-            q @ (b'\'' | b'"') => {
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b'\\' {
-                        i += 2;
-                        continue;
-                    }
-                    if bytes[i] == q {
-                        // A doubled quote stays inside the literal.
-                        if bytes.get(i + 1) == Some(&q) {
-                            i += 2;
-                            continue;
-                        }
-                        i += 1;
-                        break;
-                    }
-                    i += 1;
+            // `'...'` / `"..."`. The body is data: a keyword, bracket or
+            // comment marker inside it is not structure. [`quoted_end`] decides
+            // where it ends, and is shared with [`FragmentLex`] so the two views
+            // cannot disagree about that.
+            b'\'' | b'"' => {
+                // An `E`/`e` prefix belongs to the literal, not to the SQL
+                // around it, so it is blanked with it.
+                if opens_extended_string(bytes, i) {
+                    out[i - 1] = b' ';
                 }
+                // An unclosed literal blanks to the end: text that never closes
+                // cannot be read as structure.
+                i = quoted_end(bytes, i).unwrap_or(bytes.len());
             }
             b if b.is_ascii() => {
                 out[i] = b.to_ascii_uppercase();
@@ -682,6 +714,79 @@ fn strip_literals(sql: &str) -> String {
         }
     }
     String::from_utf8(out).expect("all bytes are ASCII by construction")
+}
+
+/// Whether the quote at `at` opens an *extended* string, where `\` escapes the
+/// next character.
+///
+/// Verified against PostgreSQL 16 with the default
+/// `standard_conforming_strings = on`:
+///
+/// - `select 'a\'` yields `a\` — in an ordinary literal a backslash is an
+///   ordinary character, so that literal is *complete*;
+/// - `select E'a\' -- c'` yields `a' -- c` — here `\'` really is an escaped
+///   quote and the `--` is data;
+/// - `select text'a\'` yields `a\` — a *type-prefixed* literal does not escape,
+///   so the `E` must be a standalone token, not the tail of an identifier;
+/// - `U&'a\'` raises "invalid Unicode escape" — there `\` introduces a codepoint
+///   (`\0041`), never a quote escape, so it needs no handling here.
+///
+/// Quoted identifiers (`"..."`) never escape with a backslash under any setting.
+fn opens_extended_string(bytes: &[u8], at: usize) -> bool {
+    if bytes[at] != b'\'' || at == 0 {
+        return false;
+    }
+    if !bytes[at - 1].eq_ignore_ascii_case(&b'E') {
+        return false;
+    }
+    // `text'a\'` is a type-prefixed literal and does not escape, so the `E` only
+    // counts as a prefix when it stands alone. A non-ASCII byte counts as
+    // identifier material too: it cannot be established that the `E` stands
+    // alone, and guessing wrong here would over-extend the literal and hide
+    // whatever follows it.
+    if at < 2 {
+        return true;
+    }
+    let prev = bytes[at - 2];
+    !(prev.is_ascii_alphanumeric() || prev == b'_' || !prev.is_ascii())
+}
+
+/// Advances past the quoted literal or identifier opening at `at`, returning the
+/// offset just past its closing quote, or `None` if it never closes.
+///
+/// Shared by [`FragmentLex`] and [`strip_literals`] so the two cannot drift: the
+/// whole point of both is that structure outside a literal is found reliably,
+/// and that fails if they disagree on where a literal ends.
+///
+/// A doubled quote (`''`, `""`) is an escaped quote and stays inside. A
+/// backslash escapes the next character **only** in an extended string — see
+/// [`opens_extended_string`] for why, and for the PostgreSQL behaviour this
+/// mirrors. Treating `\` as an escape everywhere would let `'a\'` swallow the
+/// SQL after it, hiding a comment, a bracket or an unterminated `/*` from every
+/// check that runs on these views.
+///
+/// `None` is returned separately from `Some(bytes.len())` — a literal closing on
+/// the very last byte is well-formed, one that never closes is not, and only the
+/// caller knows whether that distinction matters to it.
+fn quoted_end(bytes: &[u8], at: usize) -> Option<usize> {
+    let q = bytes[at];
+    let escapes = opens_extended_string(bytes, at);
+    let mut i = at + 1;
+    while i < bytes.len() {
+        if escapes && bytes[i] == b'\\' {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == q {
+            if bytes.get(i + 1) == Some(&q) {
+                i += 2;
+                continue;
+            }
+            return Some(i + 1);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// If a marker or escape starts at `at`, the offset just past it.
@@ -810,45 +915,18 @@ struct SplitPredicate {
 /// both.
 const JOINERS: [&str; 4] = ["AND", "OR", "WHERE", "HAVING"];
 
-/// Finds an opening `--` or `/*` comment outside a SQL string literal or quoted
-/// identifier, returning its byte offset.
+/// Finds an opening `--` or `/*` comment, returning its byte offset.
 ///
-/// Literals are skipped so `WHERE note = 'a--b'` is not taken for a comment. The
-/// quote scan closes on the *first* non-doubled quote and deliberately does not
-/// treat `\` as an escape: under the default `standard_conforming_strings = on`
-/// a backslash is ordinary data, so `'a\'` is a complete literal and the next
-/// quote really does close it. Treating `\'` as one unit would extend an
-/// imaginary literal past that closing quote and could swallow a real comment
-/// following it — a false negative, the dangerous direction. The cost is the
-/// opposite one: under `standard_conforming_strings = off` an `E'…'` string
-/// containing `\'` closes early here, and a comment-like sequence inside it can
-/// reject a valid template. That is a compile error on working SQL, never
-/// silently wrong SQL, and it matches how callers already prefer false
-/// rejections over false acceptances.
-///
-/// Note that [`strip_literals`] resolves the same ambiguity the other way; see
-/// the comment on its quote scan for why neither choice is right for both.
+/// Takes a [`strip_literals`] view, never raw SQL: both callers pass one, and
+/// that is what makes `WHERE note = 'a--b'` safe here — the literal is already
+/// blanked, so this function needs no notion of quoting at all. Deciding where a
+/// literal ends is [`quoted_end`]'s job, in one place, for every view.
 fn find_comment(sql: &str) -> Option<usize> {
     let bytes = sql.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            // SQL escapes a quote by doubling it, so the closing quote is just
-            // the next one; a doubled quote restarts the literal on the next
-            // iteration.
-            q @ (b'\'' | b'"') => {
-                i += 1;
-                while i < bytes.len() && bytes[i] != q {
-                    i += 1;
-                }
-                i += 1;
-            }
-            b'-' if bytes[i + 1..].starts_with(b"-") => return Some(i),
-            b'/' if bytes[i + 1..].starts_with(b"*") => return Some(i),
-            _ => i += 1,
-        }
-    }
-    None
+    (0..bytes.len()).find(|&i| {
+        (bytes[i] == b'-' && bytes[i + 1..].starts_with(b"-"))
+            || (bytes[i] == b'/' && bytes[i + 1..].starts_with(b"*"))
+    })
 }
 
 /// Keywords that end the predicate the marker sits in. Everything from one of
@@ -858,8 +936,19 @@ fn find_comment(sql: &str) -> Option<usize> {
 /// [`strip_literals`] view: on raw text, every keyword here is also a false
 /// positive waiting inside some string literal.
 const CLAUSE_ENDS: [&str; 13] = [
-    "GROUP", "ORDER", "LIMIT", "OFFSET", "HAVING", "UNION", "INTERSECT", "EXCEPT",
-    "RETURNING", "FETCH", "FOR", "WINDOW", "ON",
+    "GROUP",
+    "ORDER",
+    "LIMIT",
+    "OFFSET",
+    "HAVING",
+    "UNION",
+    "INTERSECT",
+    "EXCEPT",
+    "RETURNING",
+    "FETCH",
+    "FOR",
+    "WINDOW",
+    "ON",
 ];
 
 /// Captures the part of the predicate sitting *right* of the marker, e.g. the
@@ -930,8 +1019,7 @@ fn next_marker(rest: &str) -> Option<usize> {
     // [`marker_span`] can be asked directly — it is the single source of truth
     // for which prefixes are escapes and which are markers.
     let bytes = rest.as_bytes();
-    (0..bytes.len())
-        .find(|&i| matches!(bytes[i], b'$' | b'#') && marker_span(rest, i).is_some())
+    (0..bytes.len()).find(|&i| matches!(bytes[i], b'$' | b'#') && marker_span(rest, i).is_some())
 }
 
 /// Scans to the first byte past the predicate; see [`predicate_tail`].
@@ -955,9 +1043,7 @@ fn predicate_tail_end(stripped: &str) -> usize {
         }
         // At a word start, check whether that word ends the predicate.
         let start = i;
-        while i < bytes.len()
-            && !bytes[i].is_ascii_whitespace()
-            && !matches!(bytes[i], b')' | b';')
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() && !matches!(bytes[i], b')' | b';')
         {
             i += 1;
         }
@@ -976,11 +1062,7 @@ fn predicate_tail_end(stripped: &str) -> usize {
 /// is what makes removal well defined: anywhere else (inside a `BETWEEN`, a
 /// function call, or a `SELECT` list) there is no way to know how much text to
 /// drop without parsing SQL, so such positions are rejected outright.
-fn split_predicate(
-    pending: &str,
-    expr: String,
-    span: Span,
-) -> Result<SplitPredicate, ParseError> {
+fn split_predicate(pending: &str, expr: String, span: Span) -> Result<SplitPredicate, ParseError> {
     // A comment would make the joiner search wrong in both directions:
     // `-- and` yields a phantom joiner, and the newline closing the comment is
     // consumed as the space before a joiner, which silently comments out the
@@ -1020,8 +1102,7 @@ fn split_predicate(
                 || !upper.as_bytes()[at - 1].is_ascii_alphanumeric()
                     && upper.as_bytes()[at - 1] != b'_';
             let after_ok = end >= upper.len()
-                || !upper.as_bytes()[end].is_ascii_alphanumeric()
-                    && upper.as_bytes()[end] != b'_';
+                || !upper.as_bytes()[end].is_ascii_alphanumeric() && upper.as_bytes()[end] != b'_';
             if before_ok && after_ok && best.is_none_or(|(b, _)| at > b) {
                 best = Some((at, joiner));
             }
@@ -1302,7 +1383,8 @@ fn skip_char_literal(input: &str, start: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod fragment_checks {
-    use super::*;
+    use super::one_shot::*;
+    use super::FragmentLex;
 
     #[test]
     fn balanced_fragments_are_accepted() {
@@ -1393,7 +1475,11 @@ mod fragment_checks {
             ("/* $tag$ */ a = 1", "            a = 1"),
             ("/* ' */ a = 1", "        a = 1"),
         ] {
-            assert_eq!(fragment_comments_blanked(sql).as_deref(), Some(want), "{sql:?}");
+            assert_eq!(
+                fragment_comments_blanked(sql).as_deref(),
+                Some(want),
+                "{sql:?}"
+            );
             assert!(!fragment_comment_unterminated(sql), "{sql:?}");
         }
     }
@@ -1408,6 +1494,94 @@ mod fragment_checks {
         );
         // A non-ASCII byte outside a comment is data and survives.
         assert_eq!(fragment_comments_blanked("s = '\u{e9}'"), None);
+    }
+
+    #[test]
+    fn a_backslash_does_not_escape_in_an_ordinary_literal() {
+        // Verified against PostgreSQL 16 (`standard_conforming_strings = on`):
+        // `select 'a\'` yields `a\`, so the literal is complete and what follows
+        // is real SQL. Treating `\'` as an escape hid it — a false *acceptance*,
+        // letting a comment, a bracket or an unclosed `/*` through.
+        assert_eq!(
+            fragment_comments_blanked(r"s = 'a\' -- c").as_deref(),
+            Some(r"s = 'a\'     ")
+        );
+        assert!(fragment_comment_unterminated(r"s = 'a\' /*"));
+        assert!(fragment_brackets_unbalanced(r"s = 'a\' )"));
+        // A quoted identifier never escapes with a backslash under any setting.
+        assert_eq!(
+            fragment_comments_blanked(r#"s = "a\" -- c"#).as_deref(),
+            Some(r#"s = "a\"     "#)
+        );
+        assert!(fragment_brackets_unbalanced(r#"s = "a\" )"#));
+    }
+
+    #[test]
+    fn a_backslash_escapes_in_an_extended_string() {
+        // `select E'a\' -- c'` yields `a' -- c`: here `\'` really is an escaped
+        // quote, so the `--` is data and the literal runs on.
+        for sql in [
+            r"s = E'a\' -- c' AND d = 2",
+            r"s = e'a\' -- c' AND d = 2",
+            r"s = E'a\' /*' AND d = 2",
+        ] {
+            assert_eq!(fragment_comments_blanked(sql), None, "{sql:?}");
+            assert!(!fragment_comment_unterminated(sql), "{sql:?}");
+        }
+        assert!(!fragment_brackets_unbalanced(r"s = E'a\' )'"));
+        // The `E` is part of the literal, so it must not survive in the
+        // structure view as a stray keyword byte.
+        assert!(!FragmentLex::scan(r"s = E'x'").structure.contains('E'));
+    }
+
+    #[test]
+    fn only_a_standalone_e_prefixes_an_extended_string() {
+        // `select text'a\'` yields `a\`: a *type-prefixed* literal does not
+        // escape, so an `e` ending an identifier is not a prefix.
+        assert!(fragment_brackets_unbalanced(r"s = code'a\' )"));
+        assert!(fragment_brackets_unbalanced(r"s = t_e'a\' )"));
+        // Standalone, it is — including at the very start of the fragment.
+        assert!(!fragment_brackets_unbalanced(r"s = E'a\' )'"));
+        assert!(!fragment_brackets_unbalanced(r"E'a\' )' = s"));
+    }
+
+    #[test]
+    fn a_non_ascii_byte_before_e_does_not_make_it_a_prefix() {
+        // Whether `éE` names a type is unknowable here, and reading the `E` as a
+        // prefix is the direction that hides SQL: the literal would run past its
+        // closing quote and swallow the `)`. Stay conservative.
+        assert!(fragment_brackets_unbalanced(r"s = éE'a\' )"));
+        assert!(fragment_comments_blanked(r"s = éE'a\' -- c").is_some());
+    }
+
+    #[test]
+    fn an_unclosed_literal_is_rejected() {
+        for sql in ["'", "\"", "$q$abc", "s = 'a", "c = \"x", "s = 'it''s"] {
+            assert!(
+                fragment_literal_unterminated(sql),
+                "{sql:?} leaves a literal open"
+            );
+        }
+    }
+
+    #[test]
+    fn a_closed_literal_is_not_reported_unclosed() {
+        // A literal ending on the very last byte closes; the check must not read
+        // "ran to the end" as "never closed".
+        for sql in [
+            "s = 'a'",
+            "s = 'it''s'",
+            "\"col\" = 1",
+            "s = $q$a$q$",
+            "a = 1 /* it's */",
+            "a = 1",
+            r"s = 'a\'",
+        ] {
+            assert!(
+                !fragment_literal_unterminated(sql),
+                "{sql:?} closes its literals"
+            );
+        }
     }
 
     #[test]
@@ -1431,12 +1605,7 @@ mod fragment_checks {
     fn a_comment_marker_inside_a_literal_is_not_a_comment() {
         // Inside a literal there is no comment to find, so these survive
         // verbatim.
-        for sql in [
-            "s = '--'",
-            "s = $tag$--$tag$",
-            "s = '/*'",
-            "\"--\" = 1",
-        ] {
+        for sql in ["s = '--'", "s = $tag$--$tag$", "s = '/*'", "\"--\" = 1"] {
             assert_eq!(fragment_comments_blanked(sql), None, "{sql:?}");
             assert!(!fragment_comment_unterminated(sql), "{sql:?}");
         }
@@ -1595,10 +1764,7 @@ mod tests {
 
     #[test]
     fn nested_braces_in_struct_literal() {
-        assert_eq!(
-            parse("${ S { id: 1 }.id }"),
-            vec![bind("S { id: 1 }.id")]
-        );
+        assert_eq!(parse("${ S { id: 1 }.id }"), vec![bind("S { id: 1 }.id")]);
     }
 
     #[test]
@@ -1654,31 +1820,40 @@ mod tests {
 
     #[test]
     fn reference_expr() {
-        assert_eq!(parse("ANY(${&all_ids})"), vec![text("ANY("), bind("&all_ids"), text(")")]);
+        assert_eq!(
+            parse("ANY(${&all_ids})"),
+            vec![text("ANY("), bind("&all_ids"), text(")")]
+        );
     }
 
     #[test]
     fn escape_bind_marker() {
-        assert_eq!(parse("SELECT '$${literal}'"), vec![text("SELECT '${literal}'")]);
+        assert_eq!(
+            parse("SELECT '$${literal}'"),
+            vec![text("SELECT '${literal}'")]
+        );
     }
 
     #[test]
     fn escape_fragment_marker() {
-        assert_eq!(parse("SELECT '##{literal}'"), vec![text("SELECT '#{literal}'")]);
+        assert_eq!(
+            parse("SELECT '##{literal}'"),
+            vec![text("SELECT '#{literal}'")]
+        );
     }
 
     #[test]
     fn escape_then_real_interpolation() {
-        assert_eq!(
-            parse("$${a} AND ${b}"),
-            vec![text("${a} AND "), bind("b")]
-        );
+        assert_eq!(parse("$${a} AND ${b}"), vec![text("${a} AND "), bind("b")]);
     }
 
     #[test]
     fn bare_dollar_is_literal() {
         // Positional parameters and casts must survive untouched.
-        assert_eq!(parse("SELECT $1, a::text"), vec![text("SELECT $1, a::text")]);
+        assert_eq!(
+            parse("SELECT $1, a::text"),
+            vec![text("SELECT $1, a::text")]
+        );
     }
 
     #[test]
@@ -1835,8 +2010,9 @@ mod tests {
     fn optional_without_a_joiner_errors() {
         let err = parse_template("SELECT id, ${?extra} FROM t", Span::call_site()).unwrap_err();
         assert!(
-            err.message
-                .starts_with("`${?...}` must sit in a predicate introduced by `WHERE`, `AND` or `OR`."),
+            err.message.starts_with(
+                "`${?...}` must sit in a predicate introduced by `WHERE`, `AND` or `OR`."
+            ),
             "{}",
             err.message
         );
@@ -1844,8 +2020,7 @@ mod tests {
 
     #[test]
     fn optional_after_between_errors() {
-        let err =
-            parse_template("WHERE age BETWEEN ${?lo} AND 9", Span::call_site()).unwrap_err();
+        let err = parse_template("WHERE age BETWEEN ${?lo} AND 9", Span::call_site()).unwrap_err();
         assert!(
             err.message
                 .starts_with("`${?...}` must follow a comparison operator, but follows `BETWEEN`."),
@@ -1856,8 +2031,7 @@ mod tests {
 
     #[test]
     fn optional_inside_parens_errors() {
-        let err =
-            parse_template("WHERE (a = ${?x} OR b = 1)", Span::call_site()).unwrap_err();
+        let err = parse_template("WHERE (a = ${?x} OR b = 1)", Span::call_site()).unwrap_err();
         assert!(
             err.message.starts_with(
                 "`${?...}` must be a whole top-level predicate, but `(` appears \
@@ -1870,11 +2044,8 @@ mod tests {
 
     #[test]
     fn optional_inside_function_call_errors() {
-        let err = parse_template(
-            "WHERE d >= make_interval(days => ${?d})",
-            Span::call_site(),
-        )
-        .unwrap_err();
+        let err = parse_template("WHERE d >= make_interval(days => ${?d})", Span::call_site())
+            .unwrap_err();
         assert!(
             err.message
                 .starts_with("`${?...}` must be a whole top-level predicate, but `(` appears"),
@@ -1909,15 +2080,17 @@ mod tests {
     fn comment_like_text_inside_a_literal_after_the_marker_is_not_a_comment() {
         // `'--'` is data, and marker regions of a template without optionals are
         // never flagged: only templates using `${?..}` are checked at all.
-        let parts =
-            parse_template("WHERE a = ${?x} AND note = '--'", Span::call_site()).unwrap();
+        let parts = parse_template("WHERE a = ${?x} AND note = '--'", Span::call_site()).unwrap();
         assert_eq!(
             parts,
-            vec![opt("x", "WHERE", " a = "), Part::Joined {
-                joiner: "AND".to_string(),
-                text: " note = '--'".to_string(),
-                clause: 1
-            }]
+            vec![
+                opt("x", "WHERE", " a = "),
+                Part::Joined {
+                    joiner: "AND".to_string(),
+                    text: " note = '--'".to_string(),
+                    clause: 1
+                }
+            ]
         );
     }
 

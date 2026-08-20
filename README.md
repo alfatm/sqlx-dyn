@@ -368,8 +368,36 @@ A `--` or `/*` inside a string literal or dollar-quoted body is data and passes
 through untouched. So is a quote inside a comment: `/* it's */` is a comment
 containing an apostrophe, not a comment plus an open literal.
 
+Where a literal *ends* follows PostgreSQL's default
+`standard_conforming_strings = on`:
+
+| Literal | Backslash before the closing quote |
+| --- | --- |
+| `'a\'` | ordinary data — the literal **ends** here |
+| `"a\"` | ordinary data — identifiers never escape with `\` |
+| `E'a\'` | an **escape** — the literal continues |
+| `code'a\'` | ordinary data — a *type-prefixed* literal does not escape |
+| `U&'a\'` | ordinary data — `\` starts a codepoint (`\0041`), not an escape |
+
+So `s = 'a\' -- c` is a complete literal followed by a real comment, and the
+comment is stripped. `s = E'a\' -- c'` is one extended string whose body happens
+to contain `--`, and it is left alone. `standard_conforming_strings = off` is not
+supported.
+
+The `E` counts only when it stands alone, which is why `code'a\'` is an ordinary
+literal. A non-ASCII byte before it also blocks the prefix: whether `éE` names a
+type cannot be decided here, and reading the `E` as a prefix is the direction
+that over-extends the literal and hides SQL.
+
 An **unterminated** `/*` is rejected rather than stripped: there is no end to
 strip up to, so it would swallow whatever follows the marker.
+
+An unclosed `'`, `"` or `$tag$` is rejected for the same reason one step out. A
+fragment is spliced verbatim, so the literal does not stop at the fragment's
+edge: it runs into the template and consumes the SQL after the marker.
+PostgreSQL rejects that statement rather than silently matching other rows — but
+which template the fragment lands in decides whether it does, so it fails at the
+`sql_fragment!` call instead.
 
 A fragment that contributes nothing but a comment is rejected too. It would
 splice an empty string, leaving `WHERE #{F}` as a bare `WHERE` — an error
@@ -446,6 +474,13 @@ query!("SELECT * FROM foo WHERE a = ${next_id()} OR b = ${next_id()}")
 `$${` yields a literal `${` and `##{` yields a literal `#{`. A `$` or `#` that
 is not followed by `{` is never special, so `SELECT $1` and `a # b` need no
 escaping.
+
+Escaping is the only way to write a literal marker, because interpolation is a
+text layer *above* SQL: markers are found by position in the template, before
+anything is read as SQL. A `${...}` inside a string literal or a SQL comment
+still interpolates. The lexical rules above — where a literal ends, what a
+comment covers — decide how a template is *checked*, never whether a marker is a
+marker.
 
 ## Generated code
 
@@ -532,7 +567,7 @@ The injection model is tested from both sides:
   needs no daemon:
 
   ```sh
-  cargo test                     # 253 tests, no Docker
+  cargo test                     # 264 tests, no Docker
   cargo test --features e2e      # + 16 tests against a real server
   ```
 

@@ -44,6 +44,8 @@ impl SqlFragment {
     ///   match — and an unterminated `/*`, which the macro rejects outright;
     /// - text that contributes no SQL, which splices an empty string and leaves
     ///   `WHERE #{F}` as a bare `WHERE`;
+    /// - an unclosed `'`, `"` or `$tag$`, which does not stop at the fragment's
+    ///   edge and swallows the template text after the marker;
     /// - a leading `AND`/`OR`, which is left dangling when the optional
     ///   predicate before it drops;
     /// - brackets that do not balance within the fragment, which reach into the

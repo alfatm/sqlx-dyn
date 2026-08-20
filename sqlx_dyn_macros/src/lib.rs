@@ -2,10 +2,7 @@
 
 mod parse;
 
-use parse::{
-    fragment_brackets_unbalanced, fragment_comment_unterminated, fragment_comments_blanked,
-    fragment_is_empty, fragment_starts_with_joiner, parse_template, Part,
-};
+use parse::{parse_template, FragmentLex, Part};
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::quote;
@@ -60,17 +57,16 @@ pub fn query_scalar(input: TokenStream) -> TokenStream {
 /// so the result stays usable in a `const` item.
 ///
 /// Only string literals are accepted, so runtime data cannot reach a fragment
-/// through this macro. SQL comments are stripped from the text
-/// ([`parse::fragment_comments_blanked`]), and it is rejected if it leaves a
-/// block comment unterminated ([`parse::fragment_comment_unterminated`]),
-/// contributes no SQL at all ([`parse::fragment_is_empty`]), starts with
-/// `AND`/`OR` ([`parse::fragment_starts_with_joiner`]) or leaves brackets
-/// unbalanced ([`parse::fragment_brackets_unbalanced`]). Clause keywords are
-/// deliberately allowed; the last of those explains why.
+/// through this macro. SQL comments are stripped from the text, and the fragment
+/// is rejected if it leaves a block comment unterminated, leaves a quoted
+/// literal unclosed, contributes no SQL at all, starts with `AND`/`OR`, or
+/// leaves brackets unbalanced. Clause keywords are deliberately allowed; the
+/// `FragmentLex` method behind each check documents why.
 ///
-/// Every one of those checks reads the single lexical pass in
-/// [`parse::FragmentLex`], because literals and comments hide each other's
-/// delimiters and cannot be scanned in layers.
+/// Every one of those checks reads a single lexical pass over the literal,
+/// because literals and comments hide each other's delimiters and cannot be
+/// scanned in layers. The scan and the checks are private; run
+/// `cargo doc --document-private-items` to read them.
 #[proc_macro]
 pub fn sql_fragment(input: TokenStream) -> TokenStream {
     let lit = match syn::parse::<LitStr>(input) {
@@ -79,7 +75,8 @@ pub fn sql_fragment(input: TokenStream) -> TokenStream {
     };
     // An unclosed `/*` has no end to blank up to, and would comment out the
     // template text after the marker. Nothing to salvage — reject it.
-    if fragment_comment_unterminated(&lit.value()) {
+    let lex = FragmentLex::scan(&lit.value());
+    if lex.comment_unterminated() {
         return syn::Error::new(
             lit.span(),
             "this SQL fragment leaves a block comment unterminated.\n\
@@ -92,10 +89,27 @@ pub fn sql_fragment(input: TokenStream) -> TokenStream {
         .to_compile_error()
         .into();
     }
+    // An unclosed `'`, `"` or `$tag$` runs past the marker and swallows template
+    // SQL. PostgreSQL will reject the result, but whether it does depends on the
+    // template rather than on the fragment — so it fails here, where it is
+    // written.
+    if lex.literal_unterminated() {
+        return syn::Error::new(
+            lit.span(),
+            "this SQL fragment leaves a quoted literal unclosed.\n\
+             A fragment is spliced verbatim, so the literal does not end at the \
+             fragment's edge: it runs on into the template and swallows the SQL \
+             after the marker. PostgreSQL then rejects the whole statement, and \
+             which template the fragment is used in decides whether it does.\n\
+             Close the quote, or double it (`''`, `\"\"`) if it is data.",
+        )
+        .to_compile_error()
+        .into();
+    }
     // A fragment that contributes nothing splices an empty string into the
     // template, so `WHERE #{F}` becomes a bare `WHERE`: a runtime syntax error
     // pointing at the template rather than at the fragment behind it.
-    if fragment_is_empty(&lit.value()) {
+    if lex.is_empty() {
         return syn::Error::new(
             lit.span(),
             "this SQL fragment contributes no SQL.\n\
@@ -112,11 +126,12 @@ pub fn sql_fragment(input: TokenStream) -> TokenStream {
     // rule, and let the fragment keep working. Whitespace is left as written:
     // a fragment is spliced verbatim, so its edges are the separators between it
     // and the template around it.
-    let value = lit.value();
-    let sql = fragment_comments_blanked(&value).unwrap_or(value);
-    let lit = LitStr::new(&sql, lit.span());
+    let lit = match lex.comments_blanked() {
+        Some(sql) => LitStr::new(sql, lit.span()),
+        None => lit,
+    };
 
-    if let Some(kw) = fragment_starts_with_joiner(&lit.value()) {
+    if let Some(kw) = lex.starts_with_joiner() {
         return syn::Error::new(
             lit.span(),
             format!(
@@ -134,7 +149,7 @@ pub fn sql_fragment(input: TokenStream) -> TokenStream {
         .to_compile_error()
         .into();
     }
-    if fragment_brackets_unbalanced(&lit.value()) {
+    if lex.brackets_unbalanced() {
         return syn::Error::new(
             lit.span(),
             "this SQL fragment's brackets do not close within it.\n\
@@ -269,7 +284,9 @@ fn expand(template: &LitStr, construct: TokenStream2) -> TokenStream2 {
     }
 
     if has_optional {
-        let entries = introducers.iter().map(|(clause, kw)| quote! { (#clause, #kw) });
+        let entries = introducers
+            .iter()
+            .map(|(clause, kw)| quote! { (#clause, #kw) });
         quote! {{
             let mut __sqlx_dyn_builder =
                 ::sqlx_dyn::__private::QueryBuilder::<::sqlx_dyn::__private::Postgres>::new(#init);

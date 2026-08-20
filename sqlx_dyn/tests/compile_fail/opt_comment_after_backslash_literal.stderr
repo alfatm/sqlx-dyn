@@ -1,0 +1,7 @@
+error: SQL comments are not supported in a template using `${?..}`.
+       A comment after the marker hides the keyword that follows it: the predicate tail stops at that keyword, and the newline closing a line comment is dropped, so the surviving keyword ends up commented out and the query silently matches the wrong rows.
+       Remove the comment or build this query without `${?..}`.
+  --> tests/compile_fail/opt_comment_after_backslash_literal.rs:10:21
+   |
+10 |     let _q = query!(r"SELECT * FROM t WHERE a = ${?v} AND s = 'a\' -- c AND b = 1");
+   |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

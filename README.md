@@ -263,7 +263,7 @@ therefore built from the template alone.
 
 `sql_fragment!` checks one thing: that the fragment's brackets balance within
 it. An unmatched bracket is not just broken SQL of the author's own making — it
-reaches into the *template's* nesting, where a `)` can close a construct the
+reaches into the _template's_ nesting, where a `)` can close a construct the
 fragment never opened. `sql_fragment!("a = 1) AND (b = 2")` is rejected at
 compile time even though its bracket counts match.
 
@@ -312,7 +312,7 @@ the macro thinks `b` still belongs to the first select — where the mandatory
 
 Three signals, in order of how early you see them:
 
-1. `.sql()` shows a clause keyword coming *from a fragment* with an `AND`/`OR`
+1. `.sql()` shows a clause keyword coming _from a fragment_ with an `AND`/`OR`
    after it that has no `WHERE` in between.
 2. PostgreSQL fails with a syntax error at or after the boundary. It never
    returns wrong rows for this — the statement does not parse.
@@ -322,7 +322,7 @@ Three signals, in order of how early you see them:
 #### How to fix it
 
 A fragment is for the part you reuse — a predicate, an ordering, a join. The
-query's *shape*, including any `UNION`, belongs in the template. Splitting it
+query's _shape_, including any `UNION`, belongs in the template. Splitting it
 that way makes the fragment more useful, not less: the same predicate can then
 apply on both sides of the boundary.
 
@@ -366,7 +366,7 @@ passes through untouched.
 An **unterminated** `/*` is rejected rather than stripped: there is no end to
 strip up to, so it would swallow whatever follows the marker.
 
-`sql_fragment!` also rejects a fragment that *starts* with `AND`/`OR`, for the
+`sql_fragment!` also rejects a fragment that _starts_ with `AND`/`OR`, for the
 same reason: the joiner says how the fragment is combined, not what it is, and
 only the template can hand a dropped `WHERE` over to it. Write
 `WHERE a = ${?x} AND #{F}`, not `WHERE a = ${?x} #{AND_F}`.
@@ -545,7 +545,7 @@ itself.
 
 ```toml
 [dependencies]
-sqlx_dyn = "0.1.1"
+sqlx_dyn = "0.1.2"
 sqlx = { version = "0.9", features = ["postgres", "runtime-tokio"] }
 ```
 

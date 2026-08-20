@@ -2,7 +2,9 @@
 
 mod parse;
 
-use parse::{fragment_brackets_unbalanced, parse_template, Part};
+use parse::{
+    fragment_brackets_unbalanced, fragment_starts_with_joiner, parse_template, Part,
+};
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::quote;
@@ -66,6 +68,23 @@ pub fn sql_fragment(input: TokenStream) -> TokenStream {
         Ok(lit) => lit,
         Err(err) => return err.to_compile_error().into(),
     };
+    if let Some(kw) = fragment_starts_with_joiner(&lit.value()) {
+        return syn::Error::new(
+            lit.span(),
+            format!(
+                "a SQL fragment must not start with `{kw}`: the joiner belongs to \
+                 the template.\n\
+                 A `#{{...}}` marker is opaque, so the macro cannot hand a \
+                 dropped `WHERE` over to a joiner hidden inside the fragment. If \
+                 the optional predicate before it is `None`, the `{kw}` is left \
+                 dangling: `WHERE a = ${{?x}} #{{F}}` becomes `FROM t {kw} b = 1`.\n\
+                 Write the joiner in the template instead: \
+                 `WHERE a = ${{?x}} {kw} #{{F}}`."
+            ),
+        )
+        .to_compile_error()
+        .into();
+    }
     if fragment_brackets_unbalanced(&lit.value()) {
         return syn::Error::new(
             lit.span(),

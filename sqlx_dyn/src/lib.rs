@@ -248,6 +248,12 @@
 //! If a fragment genuinely must carry a boundary, drop `${?...}` from that
 //! template: with plain binds `${...}` there is no bookkeeping to invalidate.
 //!
+//! For the same reason [`sql_fragment!`] rejects a fragment that *starts* with
+//! `AND`/`OR`. The joiner describes how the fragment is combined, not what it
+//! is, so it belongs in the template where the scanner can hand a dropped
+//! `WHERE` over to it: write `WHERE a = ${?x} AND #{F}`, not
+//! `WHERE a = ${?x} #{AND_F}`.
+//!
 //! Two cases that look similar and are fine: a fragment's own leading `WHERE`
 //! (it opens the very clause the surrounding predicates already belong to), and
 //! a boundary nested in brackets (a subquery or CTE body leaves the template's

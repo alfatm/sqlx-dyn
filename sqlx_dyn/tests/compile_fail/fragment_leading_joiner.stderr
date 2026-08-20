@@ -1,0 +1,7 @@
+error: a SQL fragment must not start with `AND`: the joiner belongs to the template.
+       A `#{...}` marker is opaque, so the macro cannot hand a dropped `WHERE` over to a joiner hidden inside the fragment. If the optional predicate before it is `None`, the `AND` is left dangling: `WHERE a = ${?x} #{F}` becomes `FROM t AND b = 1`.
+       Write the joiner in the template instead: `WHERE a = ${?x} AND #{F}`.
+ --> tests/compile_fail/fragment_leading_joiner.rs:8:28
+  |
+8 |     let _f = sql_fragment!("AND b = 1");
+  |                            ^^^^^^^^^^^

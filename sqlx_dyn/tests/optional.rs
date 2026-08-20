@@ -1488,3 +1488,72 @@ fn a_fragment_boundary_is_harmless_without_optional_predicates() {
         "SELECT x FROM t WHERE deleted_at IS NULL UNION SELECT x FROM u"
     );
 }
+
+// --- structure before the marker is matched on SQL, not on literal data ---
+//
+// The tail *after* the marker was already literal-aware; the bracket/comma scan
+// and the comment check *before* it were not, and rejected valid SQL.
+
+#[test]
+fn a_bracket_inside_a_literal_before_the_marker_is_data() {
+    let x: Option<i32> = None;
+    assert_eq!(
+        query!("SELECT * FROM t WHERE coalesce(a, ')') = ${?x}").sql(),
+        "SELECT * FROM t"
+    );
+    let x = Some(1i32);
+    assert_eq!(
+        query!("SELECT * FROM t WHERE coalesce(a, ')') = ${?x}").sql(),
+        "SELECT * FROM t WHERE coalesce(a, ')') = $1"
+    );
+}
+
+#[test]
+fn a_comma_inside_a_literal_before_the_marker_is_data() {
+    let x = Some(1i32);
+    assert_eq!(
+        query!("SELECT * FROM t WHERE coalesce(a, ',') = ${?x}").sql(),
+        "SELECT * FROM t WHERE coalesce(a, ',') = $1"
+    );
+}
+
+#[test]
+fn a_bracket_inside_a_dollar_quote_before_the_marker_is_data() {
+    let x = Some(1i32);
+    assert_eq!(
+        query!("SELECT * FROM t WHERE coalesce(a, $q$)$q$) = ${?x}").sql(),
+        "SELECT * FROM t WHERE coalesce(a, $q$)$q$) = $1"
+    );
+}
+
+#[test]
+fn a_comment_marker_inside_a_literal_is_not_a_comment() {
+    // `find_comment` ran on raw text and did not know dollar quotes, so this
+    // was rejected as "SQL comments are not supported".
+    let x: Option<i32> = None;
+    assert_eq!(
+        query!("SELECT * FROM t WHERE s = $tag$--$tag$ AND a = ${?x}").sql(),
+        "SELECT * FROM t WHERE s = $tag$--$tag$"
+    );
+    assert_eq!(
+        query!("SELECT * FROM t WHERE s = '--' AND a = ${?x}").sql(),
+        "SELECT * FROM t WHERE s = '--'"
+    );
+    assert_eq!(
+        query!("SELECT * FROM t WHERE s = '/*' AND a = ${?x}").sql(),
+        "SELECT * FROM t WHERE s = '/*'"
+    );
+}
+
+// --- Rust comments inside an interpolation ---
+
+#[test]
+fn a_rust_comment_inside_an_interpolation_is_skipped() {
+    // `find_close` tracked braces and strings but not comments, so the `}` in
+    // `/* } */` ended the marker and the rest was reported as invalid Rust.
+    let a = 1i32;
+    assert_eq!(query!("SELECT ${/* } */ a}").sql(), "SELECT $1");
+    assert_eq!(query!("SELECT ${a /* } */}").sql(), "SELECT $1");
+    assert_eq!(query!("SELECT ${/* nested /* } */ */ a}").sql(), "SELECT $1");
+    assert_eq!(query!("SELECT ${\n// }\na}").sql(), "SELECT $1");
+}

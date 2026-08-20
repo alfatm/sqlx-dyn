@@ -280,8 +280,40 @@ const CLAUSE_BOUNDARIES: [&str; 6] =
 /// string literal or a dollar-quoted body is data and does not count.
 ///
 /// Returns `true` when the fragment must be rejected.
+/// Whether a fragment starts with `AND`/`OR`, which the template must own.
+///
+/// A fragment marker is opaque, so codegen cannot lift a joiner out of it the
+/// way [`lift_joiners_after_optionals`] does for literal text. When the optional
+/// predicate before such a fragment drops, its `WHERE` goes with it and the
+/// fragment's own `AND` is left dangling:
+///
+/// ```text
+/// query!("SELECT * FROM t WHERE a = ${?x} #{AND_B}")   // x = None
+/// -> SELECT * FROM t AND b = 1
+/// ```
+///
+/// Writing the joiner in the template instead — `WHERE a = ${?x} AND #{B}` —
+/// puts it where the scanner can see it, and the `WHERE` is handed over
+/// correctly. Nothing is lost: the joiner belongs to how the fragment is
+/// *combined*, not to the fragment.
+///
+/// Matched on the comment-blanked [`strip_literals`] view, so a leading comment
+/// does not hide the keyword.
+pub fn fragment_starts_with_joiner(sql: &str) -> Option<&'static str> {
+    let view = blank_comments(&strip_literals(sql));
+    let head = view.trim_start();
+    ["AND", "OR"].into_iter().find(|kw| {
+        head.strip_prefix(*kw).is_some_and(|rest| {
+            // A word boundary is required, or a column named `android` would
+            // look like a leading `AND`.
+            rest.is_empty()
+                || !(rest.as_bytes()[0].is_ascii_alphanumeric() || rest.as_bytes()[0] == b'_')
+        })
+    })
+}
+
 pub fn fragment_brackets_unbalanced(sql: &str) -> bool {
-    let bytes = strip_literals(sql).into_bytes();
+    let bytes = blank_comments(&strip_literals(sql)).into_bytes();
     let mut depth = 0i32;
 
     for b in bytes {
@@ -441,6 +473,62 @@ fn strip_literals(sql: &str) -> String {
         }
     }
     String::from_utf8(out).expect("all bytes are ASCII by construction")
+}
+
+/// Blanks SQL comments in a [`strip_literals`] view, preserving byte offsets.
+///
+/// `strip_literals` blanks string literals but leaves comments alone, because
+/// the whole-template rule is that a template using `${?...}` may not contain
+/// one at all. Checks that only care about *structure* — brackets, joiners —
+/// must not see a bracket or keyword that sits in a comment, since that is
+/// text, not SQL.
+///
+/// Takes the stripped view rather than raw SQL so a `--` inside a literal is
+/// already gone and cannot start a phantom comment.
+fn blank_comments(stripped: &str) -> String {
+    let bytes = stripped.as_bytes();
+    let mut out = bytes.to_vec();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'-' && bytes[i + 1..].starts_with(b"-") {
+            // A line comment runs to the newline, which stays: it is whitespace
+            // either way and keeps tokens on both sides apart.
+            while i < bytes.len() && bytes[i] != b'\n' {
+                out[i] = b' ';
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i] == b'/' && bytes[i + 1..].starts_with(b"*") {
+            // Block comments nest in PostgreSQL.
+            let mut nesting = 0usize;
+            while i < bytes.len() {
+                if bytes[i] == b'/' && bytes[i + 1..].starts_with(b"*") {
+                    nesting += 1;
+                    out[i] = b' ';
+                    out[i + 1] = b' ';
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == b'*' && bytes[i + 1..].starts_with(b"/") {
+                    nesting -= 1;
+                    out[i] = b' ';
+                    out[i + 1] = b' ';
+                    i += 2;
+                    if nesting == 0 {
+                        break;
+                    }
+                    continue;
+                }
+                out[i] = b' ';
+                i += 1;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    String::from_utf8(out).expect("blanking keeps the input ASCII")
 }
 
 /// If a marker or escape starts at `at`, the offset just past it.
@@ -742,26 +830,28 @@ fn split_predicate(
     // consumed as the space before a joiner, which silently comments out the
     // surviving predicate. Recognising comments properly needs a SQL lexer, so
     // reject them.
-    if let Some(at) = find_comment(pending) {
+    // Strip literals and quoted identifiers before scanning: an `or` inside
+    // `'p or q'` or `"c or d"` would otherwise be picked as the joiner, and the
+    // cut would land mid-token, leaving an unclosed quote. Offsets are preserved
+    // because each character is replaced by exactly one space. The same view
+    // answers the comment question: a `--` inside a literal or a dollar-quoted
+    // body is data, and scanning raw text rejected `s = $tag$--$tag$ AND ..`.
+    let upper = strip_literals(pending);
+
+    if let Some(at) = find_comment(&upper) {
         return Err(ParseError::new(format!(
             "SQL comments are not supported in a template using `${{?...}}`, but \
              `{}` appears before the marker.\n\
              A comment can hide an `AND`/`OR` or swallow the predicate itself, \
              silently changing which rows match.\n\
              Remove the comment or build this query without `${{?...}}`.",
-            if pending[at..].starts_with("--") {
+            if upper[at..].starts_with("--") {
                 "--"
             } else {
                 "/*"
             }
         )));
     }
-
-    // Strip literals and quoted identifiers before scanning: an `or` inside
-    // `'p or q'` or `"c or d"` would otherwise be picked as the joiner, and the
-    // cut would land mid-token, leaving an unclosed quote. Offsets are preserved
-    // because each character is replaced by exactly one space.
-    let upper = strip_literals(pending);
 
     // Find the last joiner keyword, matching on word boundaries.
     let mut best: Option<(usize, &str)> = None;
@@ -794,6 +884,12 @@ fn split_predicate(
     })?;
 
     let after_joiner = &pending[at + joiner.len()..];
+    // Structure is matched on the stripped view, never on `after_joiner`: a
+    // bracket or comma inside a string literal, a quoted identifier or a
+    // dollar-quoted body is data, and stopping there rejects valid SQL such as
+    // `coalesce(a, ')') = ${?v}`. Offsets are preserved, so both slices index
+    // the same positions.
+    let after_joiner_upper = &upper[at + joiner.len()..];
 
     // The marker must sit at bracket depth zero relative to the joiner. An open
     // group means the marker is an argument or inside a group (`ANY(${?x})`,
@@ -802,7 +898,7 @@ fn split_predicate(
     // it is just the left operand, as in `HAVING count(*) >= ${?n}`.
     let mut depth = 0i32;
     let mut offence = None;
-    for (idx, ch) in after_joiner.char_indices() {
+    for (idx, ch) in after_joiner_upper.char_indices() {
         match ch {
             '(' => depth += 1,
             ')' => {
@@ -822,7 +918,7 @@ fn split_predicate(
         }
     }
     if offence.is_none() && depth > 0 {
-        offence = after_joiner.find('(').map(|idx| (idx, '('));
+        offence = after_joiner_upper.find('(').map(|idx| (idx, '('));
     }
     if let Some((_, ch)) = offence {
         return Err(ParseError::new(format!(
@@ -842,7 +938,9 @@ fn split_predicate(
     const SYMBOL_OPS: [&str; 7] = ["=", "<>", "!=", "<", ">", "<=", ">="];
     const WORD_OPS: [&str; 2] = ["LIKE", "ILIKE"];
     let body = after_joiner.trim_end();
-    let body_upper = body.to_ascii_uppercase();
+    // `upper` already upper-cases and blanks literals, so an operator inside a
+    // literal cannot be mistaken for the predicate's own.
+    let body_upper = after_joiner_upper[..body.len()].to_string();
     let ends_with_symbol = SYMBOL_OPS.iter().any(|op| body_upper.ends_with(op));
     let ends_with_word = WORD_OPS.iter().any(|op| {
         body_upper.strip_suffix(op).is_some_and(|head| {
@@ -904,6 +1002,43 @@ fn find_close(input: &str, from: usize) -> Option<usize> {
     let mut i = from;
 
     while i < bytes.len() {
+        // Rust comments first: a `}` or a quote inside one is text, and without
+        // this `${/* } */ 1}` cut at the wrong brace and reported the valid Rust
+        // `/*` as an invalid expression.
+        if bytes[i] == b'/' && bytes[i + 1..].starts_with(b"/") {
+            // A line comment cannot be closed inside a single-line string
+            // literal, so the interpolation would be unterminated anyway; stop
+            // at the newline and let the normal scan continue.
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i] == b'/' && bytes[i + 1..].starts_with(b"*") {
+            // Rust block comments nest.
+            let mut nesting = 0usize;
+            while i < bytes.len() {
+                if bytes[i] == b'/' && bytes[i + 1..].starts_with(b"*") {
+                    nesting += 1;
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == b'*' && bytes[i + 1..].starts_with(b"/") {
+                    nesting -= 1;
+                    i += 2;
+                    if nesting == 0 {
+                        break;
+                    }
+                    continue;
+                }
+                i += 1;
+            }
+            // An unterminated block comment consumed the rest: no closing brace.
+            if nesting != 0 {
+                return None;
+            }
+            continue;
+        }
         match bytes[i] {
             b'"' => i = skip_string(input, i)?,
             b'\'' => {
@@ -1062,6 +1197,41 @@ mod fragment_checks {
         for sql in ["(a = 1", "a = 1)", "a = 1) AND (b = 2"] {
             assert!(fragment_brackets_unbalanced(sql), "should reject {sql:?}");
         }
+    }
+
+    #[test]
+    fn a_leading_joiner_is_rejected() {
+        assert_eq!(fragment_starts_with_joiner("AND b = 1"), Some("AND"));
+        assert_eq!(fragment_starts_with_joiner("  or b = 1"), Some("OR"));
+        assert_eq!(
+            fragment_starts_with_joiner("/* c */ AND b = 1"),
+            Some("AND")
+        );
+    }
+
+    #[test]
+    fn a_word_merely_starting_with_a_joiner_is_accepted() {
+        for sql in [
+            "android = true",
+            "order_id = 1",
+            "origin = 'x'",
+            "ORDER BY name",
+            "a = 1 AND b = 2",
+            "deleted_at IS NULL",
+        ] {
+            assert_eq!(fragment_starts_with_joiner(sql), None, "{sql:?}");
+        }
+    }
+
+    #[test]
+    fn a_bracket_inside_a_comment_is_data() {
+        // The bracket check runs on a comment-blanked view, so a `)` written
+        // inside a comment does not look like an unbalanced bracket.
+        assert!(!fragment_brackets_unbalanced("a = 1 /* ) */"));
+        assert!(!fragment_brackets_unbalanced("a = 1 -- )"));
+        assert!(!fragment_brackets_unbalanced("a = 1 /* nested /* ) */ */"));
+        // ...but a real imbalance outside a comment still is one.
+        assert!(fragment_brackets_unbalanced("a = 1 /* x */ )"));
     }
 
     #[test]

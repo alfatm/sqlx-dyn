@@ -346,6 +346,11 @@ If a fragment genuinely must carry a boundary — a generated statement, say —
 drop `${?...}` from that template: with plain binds `${...}` there is no
 bookkeeping to invalidate. Or assemble that query with `builder_mut()`.
 
+`sql_fragment!` also rejects a fragment that *starts* with `AND`/`OR`, for the
+same reason: the joiner says how the fragment is combined, not what it is, and
+only the template can hand a dropped `WHERE` over to it. Write
+`WHERE a = ${?x} AND #{F}`, not `WHERE a = ${?x} #{AND_F}`.
+
 Two cases that look similar but are fine:
 
 - **A fragment's own leading `WHERE`** — `sql_fragment!("WHERE x = 1")` opens the
@@ -495,7 +500,7 @@ The injection model is tested from both sides:
   needs no daemon:
 
   ```sh
-  cargo test                     # 233 tests, no Docker
+  cargo test                     # 241 tests, no Docker
   cargo test --features e2e      # + 16 tests against a real server
   ```
 

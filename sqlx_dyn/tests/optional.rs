@@ -621,6 +621,66 @@ fn tail_stops_at_a_closing_paren() {
     );
 }
 
+#[test]
+fn a_group_opened_inside_the_tail_is_taken_whole() {
+    // Regression: the tail stopped at *any* `)`, including one closing a group
+    // it had opened itself. The group was cut in half, its `)` stayed behind as
+    // mandatory text, and dropping the predicate emitted `SELECT * FROM t)`.
+    let x: Option<i32> = Some(1);
+    assert_eq!(
+        query!("SELECT * FROM o WHERE total = ${?x} + coalesce(tax, 0)").sql(),
+        "SELECT * FROM o WHERE total = $1 + coalesce(tax, 0)"
+    );
+    let x: Option<i32> = None;
+    assert_eq!(
+        query!("SELECT * FROM o WHERE total = ${?x} + coalesce(tax, 0)").sql(),
+        "SELECT * FROM o"
+    );
+}
+
+#[test]
+fn a_keyword_inside_a_group_in_the_tail_is_not_a_clause_boundary() {
+    // The `UNION` belongs to the subquery, not to the clause the marker sits
+    // in. Reading it as a top-level boundary left `UNION SELECT 2)` behind.
+    let x: Option<i32> = None;
+    assert_eq!(
+        query!("SELECT * FROM t WHERE a = ${?x} IN (SELECT 1 UNION SELECT 2)").sql(),
+        "SELECT * FROM t"
+    );
+}
+
+#[test]
+fn a_group_left_open_in_the_tail_is_not_swallowed() {
+    // The template is already malformed — `Some` emits an unclosed `(` too, and
+    // PostgreSQL rejects either branch. What matters is that the tail does not
+    // *hide* it: taking text past an unbalanced `(` would drop that SQL and make
+    // the `None` branch look well-formed when it is not.
+    let x: Option<i32> = None;
+    assert_eq!(
+        query!("SELECT * FROM t WHERE a = ${?x} + f(b").sql(),
+        "SELECT * FROM t(b"
+    );
+}
+
+#[test]
+fn a_clause_keyword_after_a_group_in_the_tail_still_ends_the_predicate() {
+    // Depth tracking must not swallow the real boundary: once the group closes,
+    // the next top-level keyword is mandatory SQL again.
+    let x: Option<i32> = None;
+    assert_eq!(
+        query!("SELECT * FROM t WHERE a = ${?x} + coalesce(b, 0) ORDER BY c").sql(),
+        "SELECT * FROM t ORDER BY c"
+    );
+    assert_eq!(
+        query!("SELECT * FROM t WHERE a = ${?x} + f(g(h, 1), 2) AND d = 1").sql(),
+        "SELECT * FROM t WHERE d = 1"
+    );
+    assert_eq!(
+        query!("SELECT * FROM t WHERE a = ${?x} + b[1] AND d = 1").sql(),
+        "SELECT * FROM t WHERE d = 1"
+    );
+}
+
 // --- SQL comments (rejected only where the `${?...}` logic relies on them) ---
 
 #[test]
@@ -1492,6 +1552,22 @@ fn a_fragment_boundary_is_harmless_without_optional_predicates() {
 //
 // The tail *after* the marker was already literal-aware; the bracket/comma scan
 // and the comment check *before* it were not, and rejected valid SQL.
+
+#[test]
+fn a_subscript_before_the_marker_counts_toward_depth() {
+    // The comma in `b[1,2]` delimits array bounds. Counting only parentheses
+    // read it as a top-level list separator and rejected the template.
+    let x: Option<i32> = None;
+    assert_eq!(
+        query!("SELECT * FROM t WHERE a = 1 AND b[1,2] = ${?x}").sql(),
+        "SELECT * FROM t WHERE a = 1"
+    );
+    let x = Some(1i32);
+    assert_eq!(
+        query!("SELECT * FROM t WHERE a = 1 AND b[1,2] = ${?x}").sql(),
+        "SELECT * FROM t WHERE a = 1 AND b[1,2] = $1"
+    );
+}
 
 #[test]
 fn a_bracket_inside_a_literal_before_the_marker_is_data() {

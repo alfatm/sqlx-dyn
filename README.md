@@ -187,6 +187,24 @@ This crate does not parse SQL, so it refuses positions it cannot reason about
 rather than guessing how much text to remove. For those, use a plain `${...}`
 bind or `builder_mut()`.
 
+Text after the marker goes with the predicate, up to its end: the next top-level
+`AND`/`OR`, a clause keyword, or the `)`/`;` closing the construct around it. A
+group opened inside that trailing text is part of the operand and is taken
+whole — keywords inside it included.
+
+```rust
+// none == None
+query!("SELECT * FROM o WHERE total = ${?none} + coalesce(tax, 0)")
+// -> "SELECT * FROM o"                     (the group is not cut in half)
+
+query!("SELECT * FROM t WHERE a = ${?none} IN (SELECT 1 UNION SELECT 2)")
+// -> "SELECT * FROM t"                     (the `UNION` is the subquery's)
+
+query!("SELECT * FROM t WHERE EXISTS (SELECT 1 FROM u WHERE k = ${?none})")
+// -> "SELECT * FROM t WHERE EXISTS (SELECT 1 FROM u)"
+//                                          (that `)` was opened before the marker)
+```
+
 ## SQL injection model
 
 `${expr}` is safe for untrusted data. The value is sent out-of-band as a
@@ -567,7 +585,7 @@ The injection model is tested from both sides:
   needs no daemon:
 
   ```sh
-  cargo test                     # 264 tests, no Docker
+  cargo test                     # 270 tests, no Docker
   cargo test --features e2e      # + 16 tests against a real server
   ```
 

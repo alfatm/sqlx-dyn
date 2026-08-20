@@ -963,6 +963,12 @@ const CLAUSE_ENDS: [&str; 13] = [
 /// trailing whitespace — that belongs to the mandatory text, so the separator
 /// before the next keyword survives a dropped predicate.
 ///
+/// "Top-level" is relative to the marker: a group opened inside the tail is part
+/// of the operand, so neither its `)` nor a keyword inside it ends the predicate.
+/// `coalesce(tax, 0)` and `IN (SELECT 1 UNION SELECT 2)` are taken whole. A `)`
+/// at depth zero closes a group opened *before* the marker and does end the
+/// tail, which is what keeps `EXISTS (SELECT 1 WHERE k = ${?x})` working.
+///
 /// Every token above is recognised on the [`strip_literals`] view, never on raw
 /// text: a `)` or an `AND` inside a string literal, a quoted identifier or a
 /// dollar-quoted body is data, and stopping there would cut the predicate
@@ -1030,29 +1036,65 @@ fn next_marker(rest: &str) -> Option<usize> {
 fn predicate_tail_end(stripped: &str) -> usize {
     let bytes = stripped.as_bytes();
     let mut i = 0;
+    // Groups opened *within* the tail. A `)` or a keyword only ends the
+    // predicate at depth zero: inside `coalesce(tax, 0)` or
+    // `IN (SELECT 1 UNION SELECT 2)` both are part of the operand, and stopping
+    // there cut the group in half — leaving the `)` as mandatory text, so a
+    // dropped predicate emitted `SELECT * FROM t)`.
+    let mut depth = 0u32;
+    // Where the tail would have ended if a group opened here never closes. An
+    // unbalanced `(` means the marker sits inside a group opened before it, and
+    // the text past that `(` is not ours to take.
+    let mut unclosed_at = None;
 
     while i < bytes.len() {
-        // A bracket or statement separator always ends the predicate: the
-        // marker is inside something we did not open, so the tail stops here.
-        if matches!(bytes[i], b')' | b';') {
-            return i;
-        }
-        if bytes[i].is_ascii_whitespace() {
-            i += 1;
-            continue;
+        match bytes[i] {
+            b'(' | b'[' => {
+                if depth == 0 {
+                    unclosed_at = Some(i);
+                }
+                depth += 1;
+                i += 1;
+                continue;
+            }
+            // A `)` below our own depth closes a group opened before the
+            // marker, so it is where the surrounding construct resumes.
+            b')' | b']' if depth == 0 => return i,
+            b')' | b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    unclosed_at = None;
+                }
+                i += 1;
+                continue;
+            }
+            // A statement separator ends the predicate at any depth: it cannot
+            // legally appear inside a group, so treating it as an operand would
+            // only ever extend the tail over SQL that is not ours.
+            b';' => return i,
+            b if b.is_ascii_whitespace() => {
+                i += 1;
+                continue;
+            }
+            _ => {}
         }
         // At a word start, check whether that word ends the predicate.
         let start = i;
-        while i < bytes.len() && !bytes[i].is_ascii_whitespace() && !matches!(bytes[i], b')' | b';')
+        while i < bytes.len()
+            && !bytes[i].is_ascii_whitespace()
+            && !matches!(bytes[i], b'(' | b')' | b'[' | b']' | b';')
         {
             i += 1;
         }
         let word = &stripped[start..i];
-        if JOINERS.contains(&word) || CLAUSE_ENDS.contains(&word) {
+        // Only a top-level keyword ends the predicate. A `UNION` inside a
+        // subquery in the tail belongs to that subquery, not to the clause the
+        // marker sits in.
+        if depth == 0 && (JOINERS.contains(&word) || CLAUSE_ENDS.contains(&word)) {
             return start;
         }
     }
-    stripped.len()
+    unclosed_at.unwrap_or(stripped.len())
 }
 
 /// Splits the SQL accumulated so far so the trailing predicate — the one the
@@ -1137,13 +1179,16 @@ fn split_predicate(pending: &str, expr: String, span: Span) -> Result<SplitPredi
     let mut offence = None;
     for (idx, ch) in after_joiner_upper.char_indices() {
         match ch {
-            '(' => depth += 1,
-            ')' => {
+            // Subscripts count toward depth like parentheses do: the comma in
+            // `b[1,2] = ${?x}` delimits array bounds, not a predicate list, and
+            // reading it as top-level rejected valid SQL.
+            '(' | '[' => depth += 1,
+            ')' | ']' => {
                 depth -= 1;
                 // Closing below the joiner means the group was opened before
                 // it, so the predicate is not the whole clause.
                 if depth < 0 {
-                    offence = Some((idx, ')'));
+                    offence = Some((idx, ch));
                     break;
                 }
             }
@@ -1155,7 +1200,9 @@ fn split_predicate(pending: &str, expr: String, span: Span) -> Result<SplitPredi
         }
     }
     if offence.is_none() && depth > 0 {
-        offence = after_joiner_upper.find('(').map(|idx| (idx, '('));
+        offence = after_joiner_upper
+            .find(['(', '['])
+            .map(|idx| (idx, after_joiner_upper[idx..].chars().next().unwrap()));
     }
     if let Some((_, ch)) = offence {
         return Err(ParseError::new(format!(

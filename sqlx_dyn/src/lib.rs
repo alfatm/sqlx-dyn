@@ -153,6 +153,31 @@
 //! `AND` or `OR`. Anywhere else is a compile error rather than silently wrong
 //! SQL: this crate does not parse SQL and rejects the cases it cannot justify.
 //!
+//! Text *after* the marker is taken along when the predicate drops, up to the
+//! end of the predicate: the next top-level `AND`/`OR`, a clause keyword, or the
+//! `)`/`;` closing the construct around it. A group opened inside that trailing
+//! text belongs to the operand and is taken whole, keywords inside it included:
+//!
+//! ```
+//! # use sqlx_dyn::query;
+//! let none: Option<i32> = None;
+//! // `coalesce(tax, 0)` is part of the operand, not the SQL after it.
+//! assert_eq!(
+//!     query!("SELECT * FROM o WHERE total = ${?none} + coalesce(tax, 0)").sql(),
+//!     "SELECT * FROM o"
+//! );
+//! // The `UNION` belongs to the subquery, not to the clause the marker sits in.
+//! assert_eq!(
+//!     query!("SELECT * FROM t WHERE a = ${?none} IN (SELECT 1 UNION SELECT 2)").sql(),
+//!     "SELECT * FROM t"
+//! );
+//! // A `)` closing a group opened *before* the marker ends the predicate.
+//! assert_eq!(
+//!     query!("SELECT * FROM t WHERE EXISTS (SELECT 1 FROM u WHERE k = ${?none})").sql(),
+//!     "SELECT * FROM t WHERE EXISTS (SELECT 1 FROM u)"
+//! );
+//! ```
+//!
 //! A template using `${?...}` also cannot contain a SQL comment — neither
 //! before nor after the marker: a comment can swallow the keyword joining the
 //! surviving predicates, and the query would silently match the wrong rows.

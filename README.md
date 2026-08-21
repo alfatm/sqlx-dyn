@@ -53,11 +53,11 @@ parameters.
 
 ## Markers
 
-| Syntax     | Becomes                      | Accepts                          | Untrusted input |
-| ---------- | ---------------------------- | -------------------------------- | --------------- |
-| `${expr}`  | bind parameter               | anything `Encode + Type`         | ✅ safe         |
-| `${?expr}` | optional predicate           | `Option<T>`                      | ✅ safe         |
-| `#{expr}`  | SQL text                     | `SqlFragment` only (sealed)      | ⚠️ SQL text     |
+| Syntax     | Becomes            | Accepts                     | Untrusted input |
+| ---------- | ------------------ | --------------------------- | --------------- |
+| `${expr}`  | bind parameter     | anything `Encode + Type`    | ✅ safe         |
+| `${?expr}` | optional predicate | `Option<T>`                 | ✅ safe         |
+| `#{expr}`  | SQL text           | `SqlFragment` only (sealed) | ⚠️ SQL text     |
 
 - Parameter numbering (`$1`, `$2`, …) is done by `QueryBuilder`; this crate
   never generates a `$N` itself, so splicing in a fragment never shifts your
@@ -96,7 +96,7 @@ The full rules, with examples, live in the [API reference](#documentation).
 
 ```toml
 [dependencies]
-sqlx_dyn = "0.1.2"
+sqlx_dyn = "0.1.3"
 sqlx = { version = "0.9", features = ["postgres", "runtime-tokio"] }
 ```
 

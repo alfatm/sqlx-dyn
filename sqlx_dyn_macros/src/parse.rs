@@ -168,21 +168,26 @@ pub fn parse_template(input: &str, span: Span) -> Result<Vec<Part>, ParseError> 
                         // along with it.
                         let rest = &input[expr_end + 1..];
                         let tail = predicate_tail(rest);
-                        // The tail stops at any marker or escape, so an escape
-                        // inside the predicate's own trailing text would split
-                        // it: the predicate could not be removed as one unit.
-                        if tail_is_truncated_by_escape(rest, tail) {
+                        // The tail stops at the next marker or escape, because
+                        // that text is not ours to copy. If no boundary was seen
+                        // before it, the interpolation is inside this predicate
+                        // and the predicate cannot be emitted or removed as one
+                        // unit.
+                        if tail.split_by_interpolation {
                             return Err(ParseError::new(
-                                "an `$${` or `##{` escape cannot appear inside \
-                                 the same predicate as `${?...}`.\n\
+                                "another interpolation appears inside the same \
+                                 predicate as `${?...}`.\n\
                                  The predicate must be removable as one piece, \
-                                 while an escape is unwrapped separately, so the \
-                                 two cannot overlap.\n\
-                                 Move the escaped text out of this predicate or \
-                                 use a plain bind `${...}`."
+                                 while each interpolation is expanded \
+                                 separately, so the two cannot overlap: \
+                                 `a = ${?x} || ${y}` would drop to \
+                                 `... FROM t $1`.\n\
+                                 Give the optional condition its own `AND` \
+                                 clause, or use a plain bind `${...}`."
                                     .to_string(),
                             ));
                         }
+                        let tail = tail.len;
                         predicate.predicate.after = rest[..tail].to_string();
                         // The marker sits inside the predicate its joiner
                         // opened, and `clause_map` binds a boundary keyword to
@@ -973,7 +978,7 @@ const CLAUSE_ENDS: [&str; 13] = [
 /// text: a `)` or an `AND` inside a string literal, a quoted identifier or a
 /// dollar-quoted body is data, and stopping there would cut the predicate
 /// mid-literal — emitting a dangling joiner and an unterminated quote.
-fn predicate_tail(rest: &str) -> usize {
+fn predicate_tail(rest: &str) -> Tail {
     // Never scan past another interpolation: its text is not ours, and
     // swallowing it would silently turn a bind into literal SQL — or worse, cut
     // an escape so that `$${z}` loses its leading `$` and the rest is re-read as
@@ -982,33 +987,59 @@ fn predicate_tail(rest: &str) -> usize {
     let limit = next_marker(rest).unwrap_or(rest.len());
     // Offsets in the stripped view index `rest` unchanged, so the end found
     // there cuts the original bytes.
-    let end = predicate_tail_end(&strip_literals(&rest[..limit])).min(limit);
-    rest[..end].trim_end().len()
+    let (end, stop) = predicate_tail_end(&strip_literals(&rest[..limit]));
+    let end = end.min(limit);
+    // Whether an interpolation capped the scan at all. `next_marker` returns
+    // `None` when the tail holds none, and `unwrap_or` then sets `limit` to
+    // `rest.len()` — so this is what separates "no interpolation" from "capped by
+    // one", and dropping it rejects every template whose tail simply ends.
+    let capped = limit < rest.len();
+    // A bare `#{...}` at the top level of the tail is exempt: a fragment's SQL
+    // is opaque here, and it may *be* the boundary — `WHERE a = ${?x}
+    // #{ORDER_BY_ID}` is a documented, working pattern. Whether it is instead a
+    // continuation (`#{"|| 'x'"}`) cannot be decided from the template, and may
+    // be chosen at runtime, so it stays under the fragment constraint the crate
+    // documents rather than enforces. Nested in a group the tail opened it can
+    // be neither: `f(#{F})` is positionally inside the predicate whatever the
+    // fragment says. Escapes are never exempt — `##{` is literal text, not SQL.
+    let exempt_fragment = matches!(stop, TailStop::EndOfText) && rest[limit..].starts_with("#{");
+    Tail {
+        len: rest[..end].trim_end().len(),
+        split_by_interpolation: capped && !matches!(stop, TailStop::Boundary) && !exempt_fragment,
+    }
 }
 
-/// Whether the tail stopped at an escape still belonging to this predicate.
+/// Why [`predicate_tail_end`] stopped scanning.
 ///
-/// The tail ends at the first marker or escape. If an escape follows *and* the
-/// predicate clearly continues past it — the reachable unbalanced-quote case —
-/// the predicate cannot be emitted or removed as one unit.
-fn tail_is_truncated_by_escape(rest: &str, tail: usize) -> bool {
-    let after = &rest[tail..];
-    let trimmed = after.trim_start();
-    if !(trimmed.starts_with("$${") || trimmed.starts_with("##{")) {
-        return false;
-    }
-    // A literal left open at the end of the captured tail closes only after the
-    // escape, so the escape is inside this predicate. `strip_literals` blanks a
-    // literal's bytes and runs an unterminated one to the end of its input, so
-    // an open literal is exactly a blank final byte where the source is not
-    // whitespace. This covers `'...'`, `"..."` and `$tag$...$tag$` alike —
-    // counting `'` parity saw only the first.
-    let stripped = strip_literals(&rest[..tail]);
-    stripped
-        .bytes()
-        .zip(rest[..tail].bytes())
-        .next_back()
-        .is_some_and(|(out, src)| out == b' ' && !src.is_ascii_whitespace())
+/// The caller caps the scan at the next interpolation, so where it stopped
+/// decides whether that interpolation belongs to this predicate.
+enum TailStop {
+    /// A depth-zero `)`/`]`/`;` or a top-level clause keyword. The predicate
+    /// ends here and anything after it stands on its own.
+    Boundary,
+    /// The scan ran out of text without a boundary, which means it reached the
+    /// interpolation that capped it — or the genuine end of the template.
+    EndOfText,
+    /// A group opened inside the tail never closed, so the scan ended within it.
+    /// Whatever capped the scan is nested in that group, and therefore inside
+    /// this predicate.
+    InsideGroup,
+}
+
+/// The trailing text of a predicate, plus whether capturing it was possible.
+struct Tail {
+    /// Byte length within `rest`, excluding trailing whitespace.
+    len: usize,
+    /// Whether another `${...}`/`#{...}` marker — or a `$${`/`##{` escape — sits
+    /// inside this predicate rather than after it.
+    ///
+    /// The tail stops at the first interpolation either way, because its text is
+    /// not ours to copy. Where it stopped is what distinguishes the two cases: a
+    /// boundary seen first means the interpolation belongs to the SQL *after*
+    /// the predicate and both parts stand on their own. No boundary means the
+    /// predicate straddles it, and the predicate cannot be emitted or removed as
+    /// one unit — `a = ${?x} || ${y}` would drop to `SELECT * FROM t $1`.
+    split_by_interpolation: bool,
 }
 
 /// Offset of the next `${`/`#{` marker **or `$${`/`##{` escape**.
@@ -1033,7 +1064,13 @@ fn next_marker(rest: &str) -> Option<usize> {
 /// Takes the [`strip_literals`] view of the tail, not the tail itself: keyword
 /// and bracket matching must not see literal data. Offsets are preserved by that
 /// view, so the returned index also indexes the source.
-fn predicate_tail_end(stripped: &str) -> usize {
+///
+/// Returns the offset and whether the scan stopped at a *boundary* — a
+/// depth-zero `)`/`]`/`;`, a depth-zero clause keyword, or a group opened before
+/// the marker. `false` means it ran to the end of its input, which the caller
+/// capped at the next interpolation: the predicate straddles that interpolation
+/// and cannot be removed as one unit.
+fn predicate_tail_end(stripped: &str) -> (usize, TailStop) {
     let bytes = stripped.as_bytes();
     let mut i = 0;
     // Groups opened *within* the tail. A `)` or a keyword only ends the
@@ -1042,9 +1079,12 @@ fn predicate_tail_end(stripped: &str) -> usize {
     // there cut the group in half — leaving the `)` as mandatory text, so a
     // dropped predicate emitted `SELECT * FROM t)`.
     let mut depth = 0u32;
-    // Where the tail would have ended if a group opened here never closes. An
-    // unbalanced `(` means the marker sits inside a group opened before it, and
-    // the text past that `(` is not ours to take.
+    // Where a group opened *inside* the tail that never closes began. Only a
+    // depth-zero `(` records one, and the scan starts at depth zero relative to
+    // the marker, so this is always a group the tail itself opened — a group
+    // opened before the marker closes through the depth-zero `)` branch below.
+    // The tail ends where such a group began: text past an unbalanced `(` cannot
+    // be taken as the operand, since dropping it would leave the `(` behind.
     let mut unclosed_at = None;
 
     while i < bytes.len() {
@@ -1059,7 +1099,7 @@ fn predicate_tail_end(stripped: &str) -> usize {
             }
             // A `)` below our own depth closes a group opened before the
             // marker, so it is where the surrounding construct resumes.
-            b')' | b']' if depth == 0 => return i,
+            b')' | b']' if depth == 0 => return (i, TailStop::Boundary),
             b')' | b']' => {
                 depth -= 1;
                 if depth == 0 {
@@ -1071,7 +1111,7 @@ fn predicate_tail_end(stripped: &str) -> usize {
             // A statement separator ends the predicate at any depth: it cannot
             // legally appear inside a group, so treating it as an operand would
             // only ever extend the tail over SQL that is not ours.
-            b';' => return i,
+            b';' => return (i, TailStop::Boundary),
             b if b.is_ascii_whitespace() => {
                 i += 1;
                 continue;
@@ -1091,10 +1131,19 @@ fn predicate_tail_end(stripped: &str) -> usize {
         // subquery in the tail belongs to that subquery, not to the clause the
         // marker sits in.
         if depth == 0 && (JOINERS.contains(&word) || CLAUSE_ENDS.contains(&word)) {
-            return start;
+            return (start, TailStop::Boundary);
         }
     }
-    unclosed_at.unwrap_or(stripped.len())
+    // An unbalanced `(` is *not* a boundary. The group was opened inside the
+    // tail, so the interpolation that capped the scan sits within it and within
+    // this predicate: `a = ${?x} + f(${y})` dropped to `SELECT * FROM t($1)`.
+    // Reporting a boundary here declared the predicate separable when it is not.
+    // `len` still cuts at the `(`, which is what keeps the no-interpolation case
+    // (`a = ${?x} + f(b`) from swallowing text it does not own.
+    match unclosed_at {
+        Some(at) => (at, TailStop::InsideGroup),
+        None => (stripped.len(), TailStop::EndOfText),
+    }
 }
 
 /// Splits the SQL accumulated so far so the trailing predicate — the one the

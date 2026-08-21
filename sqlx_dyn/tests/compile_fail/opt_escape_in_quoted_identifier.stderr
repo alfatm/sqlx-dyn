@@ -1,7 +1,7 @@
-error: an `$${` or `##{` escape cannot appear inside the same predicate as `${?...}`.
-       The predicate must be removable as one piece, while an escape is unwrapped separately, so the two cannot overlap.
-       Move the escaped text out of this predicate or use a plain bind `${...}`.
- --> tests/compile_fail/opt_escape_in_quoted_identifier.rs:9:12
-  |
-9 |     query!("SELECT * FROM t WHERE a = ${?x} || \"$${z}\"");
-  |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+error: another interpolation appears inside the same predicate as `${?...}`.
+       The predicate must be removable as one piece, while each interpolation is expanded separately, so the two cannot overlap: `a = ${?x} || ${y}` would drop to `... FROM t $1`.
+       Give the optional condition its own `AND` clause, or use a plain bind `${...}`.
+  --> tests/compile_fail/opt_escape_in_quoted_identifier.rs:10:12
+   |
+10 |     query!("SELECT * FROM t WHERE a = ${?x} || \"$${z}\"");
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

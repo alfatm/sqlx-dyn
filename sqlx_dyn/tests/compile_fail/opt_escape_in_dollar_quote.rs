@@ -1,5 +1,4 @@
-// Same overlap again, with a dollar-quoted body holding the escape. `'` parity
-// could not see this one either.
+// Same overlap again, with a dollar-quoted body holding the escape.
 use sqlx_dyn::query;
 
 fn main() {

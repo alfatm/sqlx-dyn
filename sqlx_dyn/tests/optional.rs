@@ -613,6 +613,24 @@ fn tail_stops_at_the_next_interpolation() {
 }
 
 #[test]
+fn a_boundary_before_the_next_marker_keeps_both_predicates_whole() {
+    // The counterpart to `opt_marker_in_predicate_tail`: the tail stops at the
+    // `AND`, so `${y}` is in the SQL *after* this predicate and both stand on
+    // their own. Only a marker reached without a boundary is rejected.
+    let x: Option<i32> = None;
+    let y: i32 = 9;
+    assert_eq!(
+        query!("SELECT * FROM t WHERE a = ${?x} AND b = ${y}").sql(),
+        "SELECT * FROM t WHERE b = $1"
+    );
+    // A depth-zero `)` is a boundary too.
+    assert_eq!(
+        query!("SELECT * FROM t WHERE EXISTS (SELECT 1 WHERE k = ${?x}) AND b = ${y}").sql(),
+        "SELECT * FROM t WHERE EXISTS (SELECT 1) AND b = $1"
+    );
+}
+
+#[test]
 fn tail_stops_at_a_closing_paren() {
     let x: Option<i32> = Some(1);
     assert_eq!(
@@ -997,6 +1015,11 @@ fn a_fragment_after_a_dropped_optional_inherits_the_where() {
 
 #[test]
 fn a_trailing_clause_fragment_survives_a_dropped_optional() {
+    // A `${...}` reached without a clause boundary is rejected, because the
+    // predicate would straddle it. A `#{...}` is exempt: the fragment's SQL is
+    // opaque to the scanner and may *be* the boundary, as here. Whether it is
+    // instead a continuation cannot be decided from the template — and may be
+    // chosen at runtime — so it stays under the documented fragment constraint.
     const ORDER: SqlFragment = sql_fragment!("ORDER BY id");
     let n: Option<i64> = None;
     assert_eq!(

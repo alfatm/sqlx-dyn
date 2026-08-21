@@ -1,7 +1,7 @@
 // The predicate must be removable as one piece, while the `$${` escape is
-// unwrapped separately. When the escape sits in the predicate's own trailing
-// text — here a string literal opened before it closes after it — the two
-// overlap, and the predicate cannot be emitted or removed as one unit.
+// unwrapped separately. The tail reaches the escape without passing a clause
+// boundary, so the escape sits inside this predicate and the two overlap: the
+// predicate cannot be emitted or removed as one unit.
 use sqlx_dyn::query;
 
 fn main() {

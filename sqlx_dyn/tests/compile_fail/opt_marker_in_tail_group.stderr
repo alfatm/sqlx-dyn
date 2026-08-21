@@ -1,7 +1,7 @@
 error: another interpolation appears inside the same predicate as `${?...}`.
        The predicate must be removable as one piece, while each interpolation is expanded separately, so the two cannot overlap: `a = ${?x} || ${y}` would drop to `... FROM t $1`.
        Give the optional condition its own `AND` clause, or use a plain bind `${...}`.
- --> tests/compile_fail/opt_escape_in_predicate.rs:9:12
-  |
-9 |     query!("SELECT * FROM t WHERE a = ${?x} || '$${z}' AND b = 1");
-  |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  --> tests/compile_fail/opt_marker_in_tail_group.rs:14:12
+   |
+14 |     query!("SELECT * FROM t WHERE a = ${?x} + f(${y})");
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

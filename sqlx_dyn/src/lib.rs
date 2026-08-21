@@ -178,6 +178,39 @@
 //! );
 //! ```
 //!
+//! Another `${...}` inside that trailing text is a compile error: the predicate
+//! straddles it and cannot be removed as one piece. That includes one nested in
+//! a group the trailing text itself opened.
+//!
+//! ```compile_fail
+//! # use sqlx_dyn::query;
+//! let x: Option<i32> = None;
+//! let y: i32 = 9;
+//! // Dropping the predicate would leave `SELECT * FROM t $1`.
+//! query!("SELECT * FROM t WHERE a = ${?x} || ${y}");
+//! ```
+//!
+//! ```compile_fail
+//! # use sqlx_dyn::query;
+//! let x: Option<i32> = None;
+//! let y: i32 = 9;
+//! // And this would leave `SELECT * FROM t($1)`.
+//! query!("SELECT * FROM t WHERE a = ${?x} + f(${y})");
+//! ```
+//!
+//! A clause boundary between the two is what makes them separable, so the
+//! ordinary shape is unaffected:
+//!
+//! ```
+//! # use sqlx_dyn::query;
+//! let x: Option<i32> = None;
+//! let y: i32 = 9;
+//! assert_eq!(
+//!     query!("SELECT * FROM t WHERE a = ${?x} AND b = ${y}").sql(),
+//!     "SELECT * FROM t WHERE b = $1"
+//! );
+//! ```
+//!
 //! A template using `${?...}` also cannot contain a SQL comment — neither
 //! before nor after the marker: a comment can swallow the keyword joining the
 //! surviving predicates, and the query would silently match the wrong rows.
@@ -251,6 +284,40 @@
 //! only for *some* `Option` combinations, since all-`Some` and all-`None` often
 //! stay valid. The statement never parses, so it cannot silently match other
 //! rows.
+//!
+//! The same opacity carries a second, narrower obligation. A `${...}` reached in
+//! a predicate's trailing text is rejected at compile time, because the
+//! predicate would straddle it. A `#{...}` there cannot be judged: the fragment
+//! may *be* the clause boundary that ends the predicate, which is the working
+//! `WHERE a = ${?x} #{ORDER_BY_ID}`, or it may continue the predicate — and
+//! which one it is may be decided at runtime. So **a fragment placed in a
+//! predicate's trailing text must be a clause boundary, not a continuation of
+//! the predicate**:
+//!
+//! ```
+//! # use sqlx_dyn::{query, sql_fragment, SqlFragment};
+//! let n: Option<i64> = None;
+//! const ORDER: SqlFragment = sql_fragment!("ORDER BY id");
+//! // A boundary: the predicate ends before it, and both parts stand alone.
+//! assert_eq!(
+//!     query!("SELECT * FROM t WHERE a = ${?n} #{ORDER}").sql(),
+//!     "SELECT * FROM t ORDER BY id"
+//! );
+//! // A continuation is the mistake — `SqlFragment::new("|| 'x'")` here leaves
+//! // `SELECT * FROM t || 'x'` once the predicate drops.
+//! ```
+//!
+//! Only at the top level. Nested in a group the trailing text opened, a fragment
+//! cannot be the boundary — it is positionally inside the predicate whatever SQL
+//! it carries — so that case is rejected like a `${...}`:
+//!
+//! ```compile_fail
+//! # use sqlx_dyn::{query, sql_fragment, SqlFragment};
+//! const F: SqlFragment = sql_fragment!("1");
+//! let x: Option<i32> = None;
+//! // Would leave `SELECT * FROM t(1)`.
+//! query!("SELECT * FROM t WHERE a = ${?x} + f(#{F})");
+//! ```
 //!
 //! A fragment is for the part you reuse — a predicate, an ordering, a join. The
 //! query's *shape*, `UNION` included, belongs in the template. Split that way

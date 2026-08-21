@@ -89,9 +89,9 @@ impl<'b> Predicates<'b> {
     /// that far into a template stop being tracked independently: if such a
     /// clause's first optional predicate is `None` and a later one survives, the
     /// bit is already set from the earlier clause and the introducing `WHERE`
-    /// will not fire — a dangling `AND` remains. Clause indices grow by roughly
-    /// two per statement, so the ceiling is around 33 statements in one
-    /// template, far beyond what this crate is for. Extending it would mean a
+    /// will not fire — a dangling `AND` remains. One index is consumed per clause
+    /// boundary keyword, nested ones included, so the ceiling is 63 boundaries in
+    /// one template — far beyond what this crate is for. Extending it would mean a
     /// heap-allocated set, which costs the very allocation parity that
     /// `tests/allocations.rs` pins down.
     fn mask(clause: u32) -> u64 {

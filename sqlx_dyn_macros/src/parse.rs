@@ -591,10 +591,17 @@ mod one_shot {
 
 /// Assigns a clause index to every byte offset of the template.
 ///
-/// Index 0 covers everything before the first predicate list; each boundary
-/// keyword at bracket depth zero starts the next index. Nested keywords (a
-/// subquery's `WHERE`) keep the surrounding clause's index, because their
-/// predicates join inside the subquery, not across it.
+/// Index 0 covers everything before the first predicate list; every boundary
+/// keyword starts the next index, *including* one inside brackets. A subquery's
+/// `WHERE` opens a predicate list of its own, and its predicates join inside the
+/// subquery rather than across it — so it needs its own index, not the enclosing
+/// clause's. Sharing one collapsed the two: a `WHERE` recorded as the
+/// introducer of a dropped predicate inside the subquery fired for the first
+/// predicate emitted after the `)`, producing a second top-level `WHERE`.
+///
+/// The `)` restores the enclosing clause, which is why the map is a list of
+/// starts rather than a running counter: an offset after the subquery belongs to
+/// the clause that was open before it, not to a new one.
 ///
 /// Returns a sorted list of `(offset, clause)` starts; use [`clause_at`].
 ///
@@ -603,24 +610,30 @@ fn clause_map(upper: &str) -> Vec<(usize, u32)> {
     let bytes = upper.as_bytes();
     let mut starts = vec![(0usize, 0u32)];
     let mut clause = 0u32;
-    let mut depth = 0i32;
+    // The clause open in each enclosing bracket scope. A `)` pops back to it, so
+    // a predicate after the subquery rejoins the clause the subquery interrupted.
+    let mut enclosing: Vec<u32> = Vec::new();
     let mut i = 0;
 
     while i < bytes.len() {
         match bytes[i] {
             b'(' => {
-                depth += 1;
+                enclosing.push(clause);
                 i += 1;
             }
             b')' => {
-                depth -= 1;
+                if let Some(outer) = enclosing.pop() {
+                    clause = outer;
+                    // From the `)` onward the enclosing clause is open again.
+                    starts.push((i, clause));
+                }
                 i += 1;
             }
             // A statement separator starts a new list wherever it appears.
             b';' => {
                 clause += 1;
                 starts.push((i + 1, clause));
-                depth = 0;
+                enclosing.clear();
                 i += 1;
             }
             b if b.is_ascii_alphabetic() => {
@@ -628,18 +641,7 @@ fn clause_map(upper: &str) -> Vec<(usize, u32)> {
                 while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                     i += 1;
                 }
-                // The `depth == 0` guard currently has no *observable* effect,
-                // and that is a coincidence of how introducers are built, not a
-                // reason to drop it. Codegen records an introducer only for a
-                // predicate whose own joiner is `WHERE`/`HAVING`; a predicate
-                // separated from an earlier one by a nested boundary always
-                // carries the written `AND` instead, so its clause has no
-                // introducer either way and `open` emits `AND` in both. Deleting
-                // this guard therefore fails no test in the suite. It becomes
-                // load-bearing again the moment an introducer can be recorded
-                // for a clause a nested boundary opened — so keep it, and do not
-                // read the passing suite as evidence it is dead.
-                if depth == 0 && CLAUSE_BOUNDARIES.contains(&&upper[start..i]) {
+                if CLAUSE_BOUNDARIES.contains(&&upper[start..i]) {
                     clause += 1;
                     // The keyword itself belongs to the clause it opens, so a
                     // predicate it introduces joins inside that clause.

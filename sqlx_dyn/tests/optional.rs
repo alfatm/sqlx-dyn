@@ -746,6 +746,60 @@ fn a_subquery_where_may_hold_the_optional_itself() {
 }
 
 #[test]
+fn a_dropped_subquery_optional_does_not_lend_its_where_to_the_outer_clause() {
+    // Regression: the subquery's `WHERE` used to share the outer clause's index,
+    // so it was recorded as that clause's introducer. Dropping `k` left the
+    // introducer unclaimed, and `b` — the first predicate emitted in the outer
+    // clause — fired it, emitting `) WHERE b = $1` after the outer `WHERE` was
+    // already written. Postgres rejects two top-level `WHERE`s.
+    let k: Option<i32> = None;
+    let b: Option<i32> = Some(2);
+    assert_eq!(
+        query!("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE k = ${?k}) AND b = ${?b}")
+            .sql(),
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u) AND b = $1"
+    );
+
+    // The written `AND` is what belongs there; the other three combinations must
+    // be unaffected.
+    let k: Option<i32> = Some(1);
+    assert_eq!(
+        query!("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE k = ${?k}) AND b = ${?b}")
+            .sql(),
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE k = $1) AND b = $2"
+    );
+    let b: Option<i32> = None;
+    assert_eq!(
+        query!("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE k = ${?k}) AND b = ${?b}")
+            .sql(),
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE k = $1)"
+    );
+    let k: Option<i32> = None;
+    assert_eq!(
+        query!("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE k = ${?k}) AND b = ${?b}")
+            .sql(),
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u)"
+    );
+}
+
+#[test]
+fn a_clause_resumes_at_the_closing_bracket_of_a_nested_one() {
+    // Two levels deep: each `)` must restore the clause open before its `(`, not
+    // simply the previous index, or the innermost `WHERE` leaks out one scope at
+    // a time.
+    let k: Option<i32> = None;
+    let b: Option<i32> = Some(2);
+    assert_eq!(
+        query!(
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u \
+             WHERE EXISTS (SELECT 1 FROM v WHERE k = ${?k})) AND b = ${?b}"
+        )
+        .sql(),
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE EXISTS (SELECT 1 FROM v)) AND b = $1"
+    );
+}
+
+#[test]
 fn a_keyword_inside_a_literal_is_not_a_second_clause() {
     let x: Option<i32> = Some(1);
     assert_eq!(

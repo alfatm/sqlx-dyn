@@ -134,7 +134,9 @@ fn norm(s: String) -> String {
 /// Keyset pagination: the cursor is a *value* (binds), the sort order is *syntax*
 /// (fragment from a closed set).
 fn paginated_sql(sort_param: &str, cursor_id: Option<i64>, limit: i32) -> String {
-    let order = SortBy::parse(sort_param).unwrap_or(SortBy::Newest).fragment();
+    let order = SortBy::parse(sort_param)
+        .unwrap_or(SortBy::Newest)
+        .fragment();
 
     // The cursor is an optional predicate and the sort order is a fragment, so
     // both stay in the template. Only `LIMIT` needs an escape hatch: it is not a
@@ -181,11 +183,9 @@ fn dynamic_order_and_pagination() {
 /// several can be combined in one template.
 fn cte_and_joins(org: i64, since_days: i32) -> String {
     const ACTIVE_ONLY: SqlFragment = sql_fragment!("u.deleted_at IS NULL");
-    const JOIN_PROFILE: SqlFragment =
-        sql_fragment!("LEFT JOIN profiles p ON p.user_id = u.id");
-    const REPRESENTABLE: SqlFragment = sql_fragment!(
-        "kind::text IN ('document', 'template', 'i18n')"
-    );
+    const JOIN_PROFILE: SqlFragment = sql_fragment!("LEFT JOIN profiles p ON p.user_id = u.id");
+    const REPRESENTABLE: SqlFragment =
+        sql_fragment!("kind::text IN ('document', 'template', 'i18n')");
 
     let q = query!(
         r#"
@@ -368,7 +368,10 @@ mod execution {
     }
 
     /// A single connection works too.
-    async fn on_connection(conn: &mut sqlx::PgConnection, id: i64) -> sqlx::Result<Option<UserRow>> {
+    async fn on_connection(
+        conn: &mut sqlx::PgConnection,
+        id: i64,
+    ) -> sqlx::Result<Option<UserRow>> {
         query_as!(UserRow, "SELECT id, name FROM users WHERE id = ${id}")
             .fetch_optional(conn)
             .await

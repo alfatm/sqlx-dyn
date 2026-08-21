@@ -54,10 +54,7 @@ fn payload_cannot_close_a_string_literal_in_surrounding_sql() {
     // able to escape it, because it is not substituted textually at all.
     let payload = "' OR 1=1 --";
     let q = query!("SELECT * FROM t WHERE a = ${payload} AND b = 'literal'");
-    assert_eq!(
-        q.sql(),
-        "SELECT * FROM t WHERE a = $1 AND b = 'literal'"
-    );
+    assert_eq!(q.sql(), "SELECT * FROM t WHERE a = $1 AND b = 'literal'");
 }
 
 #[test]

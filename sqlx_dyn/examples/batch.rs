@@ -55,8 +55,16 @@ fn insert_chunked(users: &[NewUser<'_>], columns: usize) -> Vec<String> {
 
 fn multi_row_insert() {
     let users = [
-        NewUser { name: "ada", email: "ada@example.com", age: 36 },
-        NewUser { name: "alan", email: "alan@example.com", age: 41 },
+        NewUser {
+            name: "ada",
+            email: "ada@example.com",
+            age: 36,
+        },
+        NewUser {
+            name: "alan",
+            email: "alan@example.com",
+            age: 41,
+        },
     ];
 
     assert_eq!(
@@ -112,7 +120,11 @@ fn upsert_many(users: &[NewUser<'_>]) -> String {
 }
 
 fn upsert() {
-    let users = [NewUser { name: "ada", email: "ada@example.com", age: 36 }];
+    let users = [NewUser {
+        name: "ada",
+        email: "ada@example.com",
+        age: 36,
+    }];
     let sql = upsert_many(&users);
     assert!(sql.contains("VALUES ($1, $2, $3)"), "{sql}");
     assert!(sql.contains("ON CONFLICT (email) DO UPDATE SET"), "{sql}");
@@ -259,8 +271,16 @@ fn main() {
     println!();
 
     let users = [
-        NewUser { name: "ada", email: "ada@example.com", age: 36 },
-        NewUser { name: "alan", email: "alan@example.com", age: 41 },
+        NewUser {
+            name: "ada",
+            email: "ada@example.com",
+            age: 36,
+        },
+        NewUser {
+            name: "alan",
+            email: "alan@example.com",
+            age: 41,
+        },
     ];
     println!("--- multi-row INSERT ---\n{}\n", insert_many(&users));
     println!("--- UPSERT ---\n{}\n", upsert_many(&users));

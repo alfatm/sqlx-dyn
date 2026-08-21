@@ -33,9 +33,9 @@ use std::sync::OnceLock;
 
 use sqlx::{PgPool, Row};
 use sqlx_dyn::{query, query_as, query_scalar, sql_fragment, SqlFragment};
+use testcontainers_modules::postgres::Postgres as PostgresImage;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
-use testcontainers_modules::postgres::Postgres as PostgresImage;
 
 /// Pinned to a modern server; the module's default tag is Postgres 11.
 const PG_TAG: &str = "16-alpine";
@@ -169,7 +169,6 @@ async fn assert_valid(pool: &PgPool, sql: &str) {
 #[test]
 fn optional_predicates_run_for_every_combination() {
     with_pool(|pool| async move {
-
         for (name, min_age, org) in [
             (None, None, None),
             (Some("ada"), None, None),
@@ -236,7 +235,6 @@ fn a_dropped_predicate_leaves_no_dangling_keyword() {
 #[test]
 fn a_cast_after_the_marker_vanishes_with_its_predicate() {
     with_pool(|pool| async move {
-
         // The regression this pins: `None` used to emit `FROM users::uuid`.
         let missing: Option<&str> = None;
         let rows = query!("SELECT id FROM users WHERE external_id = ${?missing}::uuid")
@@ -257,7 +255,6 @@ fn a_cast_after_the_marker_vanishes_with_its_predicate() {
 #[test]
 fn a_concatenation_tail_vanishes_with_its_predicate() {
     with_pool(|pool| async move {
-
         let prefix: Option<&str> = Some("ad");
         let rows = query!("SELECT id FROM users WHERE name LIKE ${?prefix} || '%'")
             .fetch_all(pool)
@@ -281,7 +278,6 @@ fn a_concatenation_tail_vanishes_with_its_predicate() {
 #[test]
 fn where_and_having_are_independent_on_the_server() {
     with_pool(|pool| async move {
-
         for (org, min_events) in [
             (None, None),
             (Some(1i64), None),
@@ -318,7 +314,6 @@ fn where_and_having_are_independent_on_the_server() {
 #[test]
 fn union_branches_each_get_their_own_where() {
     with_pool(|pool| async move {
-
         for (a, b) in [
             (None, None),
             (Some(1i64), None),
@@ -369,7 +364,6 @@ fn a_subquery_where_does_not_open_a_new_clause() {
 #[test]
 fn injection_payloads_are_data_on_the_server() {
     with_pool(|pool| async move {
-
         for payload in [
             "'; DROP TABLE users; --",
             "1' OR '1'='1",
@@ -377,11 +371,10 @@ fn injection_payloads_are_data_on_the_server() {
             "#{FILTER}",
             "$1",
         ] {
-            let found: i64 =
-                query_scalar!("SELECT count(*) FROM users WHERE name = ${payload}")
-                    .fetch_one(pool)
-                    .await
-                    .unwrap_or_else(|err| panic!("payload {payload:?}: {err}"));
+            let found: i64 = query_scalar!("SELECT count(*) FROM users WHERE name = ${payload}")
+                .fetch_one(pool)
+                .await
+                .unwrap_or_else(|err| panic!("payload {payload:?}: {err}"));
             assert_eq!(found, 0, "payload {payload:?} matched a row");
         }
 
@@ -398,19 +391,20 @@ fn injection_payloads_are_data_on_the_server() {
 #[test]
 fn bind_order_matches_the_template() {
     with_pool(|pool| async move {
-
         // Had the binds been swapped, this would return a row instead of
         // nothing, even though the SQL text would be byte-for-byte the same.
-        let rows = query!("SELECT id FROM users WHERE name = ${\"ada\"} AND kind = ${\"template\"}")
-            .fetch_all(pool)
-            .await
-            .expect("two text binds in order");
+        let rows =
+            query!("SELECT id FROM users WHERE name = ${\"ada\"} AND kind = ${\"template\"}")
+                .fetch_all(pool)
+                .await
+                .expect("two text binds in order");
         assert!(rows.is_empty(), "ada is a document, not a template");
 
-        let rows = query!("SELECT id FROM users WHERE name = ${\"grace\"} AND kind = ${\"template\"}")
-            .fetch_all(pool)
-            .await
-            .expect("two text binds in order");
+        let rows =
+            query!("SELECT id FROM users WHERE name = ${\"grace\"} AND kind = ${\"template\"}")
+                .fetch_all(pool)
+                .await
+                .expect("two text binds in order");
         assert_eq!(rows.len(), 1);
     });
 }
@@ -486,10 +480,11 @@ fn query_scalar_infers_from_the_fetch_site() {
     with_pool(|pool| async move {
         let org: Option<i64> = Some(1);
 
-        let count: i64 = query_scalar!("SELECT count(*) FROM users WHERE organization_id = ${?org}")
-            .fetch_one(pool)
-            .await
-            .expect("i64 count");
+        let count: i64 =
+            query_scalar!("SELECT count(*) FROM users WHERE organization_id = ${?org}")
+                .fetch_one(pool)
+                .await
+                .expect("i64 count");
         assert_eq!(count, 2);
 
         let name: String = query_scalar!("SELECT name FROM users WHERE id = ${1i64}")
@@ -538,7 +533,6 @@ fn query_as_execute_runs_the_statement_and_ignores_the_row_type() {
 #[test]
 fn execute_reports_affected_rows() {
     with_pool(|pool| async move {
-
         // Isolated in a transaction so the fixture data stays untouched for
         // other tests.
         let mut tx = pool.begin().await.expect("begin");

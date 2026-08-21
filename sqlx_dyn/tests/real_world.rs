@@ -313,7 +313,10 @@ fn ddl_identifiers_are_out_of_scope() {
     // and `SqlFragment` has no constructor for runtime strings, which is
     // exactly the point: the crate refuses to launder an identifier into SQL.
     const CREATE_TEST_DB: SqlFragment = sql_fragment!("CREATE DATABASE \"cms_test_fixed\"");
-    assert_eq!(query!("#{CREATE_TEST_DB}").sql(), "CREATE DATABASE \"cms_test_fixed\"");
+    assert_eq!(
+        query!("#{CREATE_TEST_DB}").sql(),
+        "CREATE DATABASE \"cms_test_fixed\""
+    );
 }
 
 // ---------------------------------------------------------------------------

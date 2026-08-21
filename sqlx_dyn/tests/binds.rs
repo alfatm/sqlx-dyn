@@ -30,7 +30,10 @@ where
     T: BuilderAccess,
 {
     let mut built = q.builder().build();
-    let args = built.take_arguments().unwrap().expect("query has arguments");
+    let args = built
+        .take_arguments()
+        .unwrap()
+        .expect("query has arguments");
     let count = args.len();
     // `PgArguments` keeps its fields private; `Debug` is the supported way to
     // read the type list and the encoded buffer back out.

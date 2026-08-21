@@ -40,10 +40,7 @@ fn multiple_binds_are_numbered_in_order() {
     let name = "ada";
     let age: i32 = 36;
     let q = query!("SELECT * FROM users WHERE name = ${name} AND age > ${age}");
-    assert_eq!(
-        q.sql(),
-        "SELECT * FROM users WHERE name = $1 AND age > $2"
-    );
+    assert_eq!(q.sql(), "SELECT * FROM users WHERE name = $1 AND age > $2");
 }
 
 // 4. the `${&reference}` form
@@ -70,9 +67,7 @@ fn complex_expressions_bind() {
     let v: Vec<i32> = vec![1, 2, 3];
     let opt: Option<i32> = None;
 
-    let q = query!(
-        "SELECT ${foo.bar()}, ${v.len() as i32}, ${opt.unwrap_or_default()}"
-    );
+    let q = query!("SELECT ${foo.bar()}, ${v.len() as i32}, ${opt.unwrap_or_default()}");
     assert_eq!(q.sql(), "SELECT $1, $2, $3");
 }
 
@@ -111,7 +106,10 @@ fn fragments_do_not_consume_parameter_slots() {
 #[test]
 fn query_as_builds_sql() {
     let id: i64 = 3;
-    let q = query_as!(User, "SELECT id, name FROM users WHERE id = ${id} AND #{ACTIVE}");
+    let q = query_as!(
+        User,
+        "SELECT id, name FROM users WHERE id = ${id} AND #{ACTIVE}"
+    );
     assert_eq!(
         q.sql(),
         "SELECT id, name FROM users WHERE id = $1 AND deleted_at IS NULL"
@@ -162,10 +160,9 @@ async fn typecheck_query_as(pool: &sqlx::PgPool) -> sqlx::Result<()> {
     let _: Option<User> = query_as!(User, "SELECT id, name FROM users WHERE id = ${id}")
         .fetch_optional(pool)
         .await?;
-    let _: sqlx::postgres::PgQueryResult =
-        query_as!(User, "DELETE FROM users WHERE id = ${id}")
-            .execute(pool)
-            .await?;
+    let _: sqlx::postgres::PgQueryResult = query_as!(User, "DELETE FROM users WHERE id = ${id}")
+        .execute(pool)
+        .await?;
     Ok(())
 }
 

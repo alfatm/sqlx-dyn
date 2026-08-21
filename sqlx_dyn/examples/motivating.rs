@@ -56,9 +56,7 @@ async fn user_count(pool: &sqlx::PgPool, organization_id: i64) -> sqlx::Result<i
 fn main() {
     // Prove the SQL assembles without a connection.
     let all_ids: Vec<i64> = vec![1, 2, 3];
-    let q = query!(
-        r#"SELECT * FROM t WHERE author = ANY(${&all_ids}) AND #{REPRESENTABLE_KINDS}"#
-    );
+    let q = query!(r#"SELECT * FROM t WHERE author = ANY(${&all_ids}) AND #{REPRESENTABLE_KINDS}"#);
     println!("{}", q.sql());
 
     let _ = audit_stats;

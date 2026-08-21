@@ -28,8 +28,8 @@ pub struct Predicates<'b> {
     /// `open` call sets it — including the one that consumed the clause's
     /// introducer — so a consumed introducer is always "emitted" too. The bitmask
     /// keeps `Predicates` allocation-free, which `tests/allocations.rs` pins
-    /// down. Clause indices above 63 degrade to "already emitted", which degrades
-    /// to the written joiner.
+    /// down, and caps the clause index at 63 — the macro rejects a template that
+    /// would exceed it, so every index reaching here has a bit of its own.
     emitted: u64,
 }
 
@@ -85,14 +85,14 @@ impl<'b> Predicates<'b> {
 
     /// The bit for `clause`.
     ///
-    /// Indices past the bitmask width saturate and share the top bit, so clauses
-    /// that far into a template stop being tracked independently: if such a
-    /// clause's first optional predicate is `None` and a later one survives, the
-    /// bit is already set from the earlier clause and the introducing `WHERE`
-    /// will not fire — a dangling `AND` remains. One index is consumed per clause
-    /// boundary keyword, nested ones included, so the ceiling is 63 boundaries in
-    /// one template — far beyond what this crate is for. Extending it would mean a
-    /// heap-allocated set, which costs the very allocation parity that
+    /// One index is consumed per clause boundary keyword, nested ones included,
+    /// so a template with more than 64 boundaries would run past the bitmask
+    /// width. The macro rejects those at expansion time (`MAX_CLAUSE` in
+    /// `sqlx_dyn_macros::parse`), because sharing a bit loses the later clause's
+    /// pending introducer and emits a dangling `AND`. The `min` here is only a
+    /// floor for that guarantee: it keeps the shift defined rather than panicking
+    /// if an out-of-range index ever reaches this far. Widening the ceiling would
+    /// mean a heap-allocated set, which costs the allocation parity that
     /// `tests/allocations.rs` pins down.
     fn mask(clause: u32) -> u64 {
         1u64 << clause.min(63)

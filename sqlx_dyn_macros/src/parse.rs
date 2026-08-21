@@ -195,7 +195,27 @@ pub fn parse_template(input: &str, span: Span) -> Result<Vec<Part>, ParseError> 
                         // that same clause.
                         let stripped = stripped.get_or_insert_with(|| strip_literals(input));
                         let clauses = clauses.get_or_insert_with(|| clause_map(stripped));
-                        predicate.predicate.clause = clause_at(clauses, i);
+                        let clause = clause_at(clauses, i);
+                        // `Predicates` tracks one bit per clause in a `u64`, so
+                        // an index past the width would share the top bit with
+                        // an earlier clause and lose its introducing keyword,
+                        // emitting a dangling `AND`. Refuse the template rather
+                        // than expand to SQL that does not parse.
+                        if clause > MAX_CLAUSE {
+                            return Err(ParseError::new(format!(
+                                "too many clause boundaries in one template: \
+                                 this `${{?...}}` is in clause {clause}, past the \
+                                 limit of {MAX_CLAUSE}.\n\
+                                 One index is consumed per clause boundary \
+                                 keyword ({boundaries}), nested ones included, \
+                                 and each needs its own bit in a `u64` to know \
+                                 whether its introducing keyword is still \
+                                 pending.\n\
+                                 Split the query into smaller templates.",
+                                boundaries = CLAUSE_BOUNDARIES.join(", "),
+                            )));
+                        }
+                        predicate.predicate.clause = clause;
                         parts.push(Part::OptBind(predicate.predicate));
                         i = expr_end + 1 + tail;
                         continue;
@@ -262,6 +282,13 @@ pub fn parse_template(input: &str, span: Span) -> Result<Vec<Part>, ParseError> 
 /// per-clause state, one clause's `WHERE` could introduce a predicate in
 /// another, or a clause's own `WHERE` would be replaced by a dangling `AND`.
 const CLAUSE_BOUNDARIES: [&str; 6] = ["WHERE", "HAVING", "UNION", "INTERSECT", "EXCEPT", "QUALIFY"];
+
+/// The highest clause index a predicate may carry.
+///
+/// `Predicates::emitted` is a `u64` with one bit per clause, so index 63 is the
+/// last that can be tracked on its own. Templates past it are rejected at
+/// expansion time; see the check in [`parse_template`].
+const MAX_CLAUSE: u32 = 63;
 
 /// One lexical pass over a fragment, producing every view the fragment checks
 /// need.
@@ -2110,6 +2137,42 @@ mod tests {
         assert_eq!(
             parse("$${?x} WHERE a = ${?y}"),
             vec![text("${?x}"), opt("y", "WHERE", " a = ")]
+        );
+    }
+
+    /// A template whose predicate lands in a clause the `u64` mask can still
+    /// track on its own, and the next one past it.
+    fn unions_before_the_predicate(n: usize) -> String {
+        let mut sql = String::from("SELECT 1");
+        for _ in 0..n {
+            sql.push_str(" UNION SELECT 1");
+        }
+        sql.push_str(" UNION SELECT 1 WHERE a = ${?x}");
+        sql
+    }
+
+    #[test]
+    fn the_last_trackable_clause_is_accepted() {
+        // 61 unions plus the predicate's own `UNION` and `WHERE` put it in
+        // clause 63, the highest bit of `Predicates::emitted`.
+        let sql = unions_before_the_predicate(61);
+        parse_template(&sql, Span::call_site()).expect("clause 63 should parse");
+    }
+
+    #[test]
+    fn too_many_clause_boundaries_errors() {
+        // One more boundary than the mask can track. Without the guard this
+        // expanded to SQL whose introducing `WHERE` never fired, leaving a
+        // dangling `AND`.
+        let sql = unions_before_the_predicate(62);
+        let err = parse_template(&sql, Span::call_site()).unwrap_err();
+        assert!(
+            err.message.starts_with(
+                "too many clause boundaries in one template: this `${?...}` is in \
+                 clause 64, past the limit of 63."
+            ),
+            "{}",
+            err.message
         );
     }
 

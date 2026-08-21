@@ -1,0 +1,7 @@
+error: too many clause boundaries in one template: this `${?...}` is in clause 64, past the limit of 63.
+       One index is consumed per clause boundary keyword (WHERE, HAVING, UNION, INTERSECT, EXCEPT, QUALIFY), nested ones included, and each needs its own bit in a `u64` to know whether its introducing keyword is still pending.
+       Split the query into smaller templates.
+ --> tests/compile_fail/too_many_clauses.rs:9:21
+  |
+9 | ...y!("SELECT 1 UNION SELECT 1 UNION SELECT 1 UNION...NION SELECT 1 UNION SELECT 1 WHERE a = ${?x}");
+  |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^...^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

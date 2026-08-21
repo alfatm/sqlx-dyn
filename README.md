@@ -96,7 +96,7 @@ The full rules, with examples, live in the [API reference](#documentation).
 
 ```toml
 [dependencies]
-sqlx_dyn = "0.1.3"
+sqlx_dyn = "0.1.4"
 sqlx = { version = "0.9", features = ["postgres", "runtime-tokio"] }
 ```
 

@@ -592,16 +592,24 @@ mod one_shot {
 /// Assigns a clause index to every byte offset of the template.
 ///
 /// Index 0 covers everything before the first predicate list; every boundary
-/// keyword starts the next index, *including* one inside brackets. A subquery's
+/// keyword takes a fresh index, *including* one inside brackets. A subquery's
 /// `WHERE` opens a predicate list of its own, and its predicates join inside the
 /// subquery rather than across it — so it needs its own index, not the enclosing
-/// clause's. Sharing one collapsed the two: a `WHERE` recorded as the
-/// introducer of a dropped predicate inside the subquery fired for the first
-/// predicate emitted after the `)`, producing a second top-level `WHERE`.
+/// clause's. Sharing one collapsed the two: a `WHERE` recorded as the introducer
+/// of a dropped predicate inside the subquery fired for the first predicate
+/// emitted after the `)`, producing a second top-level `WHERE`.
 ///
-/// The `)` restores the enclosing clause, which is why the map is a list of
-/// starts rather than a running counter: an offset after the subquery belongs to
-/// the clause that was open before it, not to a new one.
+/// A `)` re-opens the clause that was current at the matching `(`, which is why
+/// the map is a list of starts rather than a running index: an offset past a
+/// subquery belongs to the clause the subquery interrupted, not to a new one.
+///
+/// The index is drawn from a monotonic counter and never reused. Re-deriving it
+/// by decrementing on `)` conflated two different clauses whenever a boundary
+/// followed the bracket: `WHERE EXISTS (... WHERE k = ${?k}) GROUP BY k HAVING
+/// count(*) > ${?b}` gave both the subquery's `WHERE` and the `HAVING` the same
+/// index, so the dropped inner predicate's `WHERE` fired for the `HAVING` one
+/// and emitted `GROUP BY k WHERE count(*) > $1`. Uniqueness and nesting are
+/// separate concerns: the counter provides the first, the stack the second.
 ///
 /// Returns a sorted list of `(offset, clause)` starts; use [`clause_at`].
 ///
@@ -609,9 +617,14 @@ mod one_shot {
 fn clause_map(upper: &str) -> Vec<(usize, u32)> {
     let bytes = upper.as_bytes();
     let mut starts = vec![(0usize, 0u32)];
+    // The clause currently open, and the next unused index. Two variables
+    // because a `)` moves the first back to an earlier clause while the second
+    // must keep climbing: an index that has been open once is never handed out
+    // again.
     let mut clause = 0u32;
-    // The clause open in each enclosing bracket scope. A `)` pops back to it, so
-    // a predicate after the subquery rejoins the clause the subquery interrupted.
+    let mut next = 1u32;
+    // The clause open at each enclosing `(`. A `)` re-opens it, so a predicate
+    // past the subquery rejoins the clause the subquery interrupted.
     let mut enclosing: Vec<u32> = Vec::new();
     let mut i = 0;
 
@@ -631,7 +644,8 @@ fn clause_map(upper: &str) -> Vec<(usize, u32)> {
             }
             // A statement separator starts a new list wherever it appears.
             b';' => {
-                clause += 1;
+                clause = next;
+                next += 1;
                 starts.push((i + 1, clause));
                 enclosing.clear();
                 i += 1;
@@ -642,7 +656,8 @@ fn clause_map(upper: &str) -> Vec<(usize, u32)> {
                     i += 1;
                 }
                 if CLAUSE_BOUNDARIES.contains(&&upper[start..i]) {
-                    clause += 1;
+                    clause = next;
+                    next += 1;
                     // The keyword itself belongs to the clause it opens, so a
                     // predicate it introduces joins inside that clause.
                     starts.push((start, clause));

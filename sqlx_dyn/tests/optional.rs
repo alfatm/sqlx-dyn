@@ -784,9 +784,9 @@ fn a_dropped_subquery_optional_does_not_lend_its_where_to_the_outer_clause() {
 
 #[test]
 fn a_clause_resumes_at_the_closing_bracket_of_a_nested_one() {
-    // Two levels deep: each `)` must restore the clause open before its `(`, not
-    // simply the previous index, or the innermost `WHERE` leaks out one scope at
-    // a time.
+    // Two levels deep: each `)` must re-open the clause recorded at its own `(`,
+    // so the `WHERE` of the innermost subquery reaches neither the middle one nor
+    // the outer clause.
     let k: Option<i32> = None;
     let b: Option<i32> = Some(2);
     assert_eq!(
@@ -796,6 +796,70 @@ fn a_clause_resumes_at_the_closing_bracket_of_a_nested_one() {
         )
         .sql(),
         "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE EXISTS (SELECT 1 FROM v)) AND b = $1"
+    );
+}
+
+#[test]
+fn a_boundary_after_a_subquery_does_not_reuse_the_subquerys_clause() {
+    // A clause index is never handed out twice. Deriving it by decrementing on
+    // `)` gave the subquery's `WHERE` and the following `HAVING` the same index,
+    // so dropping the inner predicate left its `WHERE` for the `HAVING` one to
+    // claim: `GROUP BY k WHERE count(*) > $1`.
+    let k: Option<i32> = None;
+    let b: Option<i64> = Some(2);
+    assert_eq!(
+        query!(
+            "SELECT k FROM t WHERE EXISTS (SELECT 1 FROM u WHERE k = ${?k}) \
+             GROUP BY k HAVING count(*) > ${?b}"
+        )
+        .sql(),
+        "SELECT k FROM t WHERE EXISTS (SELECT 1 FROM u) GROUP BY k HAVING count(*) > $1"
+    );
+
+    // The keyword-free group is incidental; the reuse is what breaks it.
+    assert_eq!(
+        query!(
+            "SELECT k FROM t WHERE EXISTS (SELECT 1 FROM u WHERE k = ${?k}) \
+             GROUP BY k HAVING b > ${?b}"
+        )
+        .sql(),
+        "SELECT k FROM t WHERE EXISTS (SELECT 1 FROM u) GROUP BY k HAVING b > $1"
+    );
+
+    // A `UNION` branch after the subquery is the same shape.
+    assert_eq!(
+        query!(
+            "SELECT x FROM t WHERE EXISTS (SELECT 1 FROM u WHERE k = ${?k}) \
+             UNION SELECT x FROM v WHERE b = ${?b}"
+        )
+        .sql(),
+        "SELECT x FROM t WHERE EXISTS (SELECT 1 FROM u) UNION SELECT x FROM v WHERE b = $1"
+    );
+}
+
+#[test]
+fn sibling_subqueries_each_keep_their_own_clause() {
+    // Both subquery `WHERE`s open at the same nesting depth, so a per-depth
+    // index would collide even though the clauses are distinct.
+    let k: Option<i32> = None;
+    let b: Option<i32> = Some(2);
+    assert_eq!(
+        query!(
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE k = ${?k}) \
+             AND EXISTS (SELECT 1 FROM v WHERE b = ${?b})"
+        )
+        .sql(),
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u) AND EXISTS (SELECT 1 FROM v WHERE b = $1)"
+    );
+    let k: Option<i32> = Some(1);
+    let b: Option<i32> = None;
+    assert_eq!(
+        query!(
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE k = ${?k}) \
+             AND EXISTS (SELECT 1 FROM v WHERE b = ${?b})"
+        )
+        .sql(),
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE k = $1) AND EXISTS (SELECT 1 FROM v)"
     );
 }
 
